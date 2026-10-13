@@ -1,0 +1,8 @@
+dev-env.sh
+*.key
+*.pem
+*.json
+!handoff-example.json
+work/
+diag-*/
+*.tar.gz
