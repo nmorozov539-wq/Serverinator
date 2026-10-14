@@ -54,7 +54,7 @@ cat > "$tmp/p2/back.json" <<EOF
   "ssh_user": "root",
   "ssh_phone_ip": "${TEST_PHONE_IP}",
   "ssh_vps_host": "203.0.113.5",
-  "ssh_vps_user": "uber",
+  "ssh_vps_user": "vpsuser",
   "ssh_vps_to_phone_pubkey": "ssh-ed25519 VPSPHONEKEY vps@host",
   "ssh_host_fingerprint": "SHA256:PHONE",
   "ssh_client_key_count": 2,
@@ -100,10 +100,10 @@ else
 fi
 
 # ── VPS: key selection ────────────────────────
-# Helper: create a mock home dir for SUDO_USER=uber with an authorized_keys
+# Helper: create a mock home dir for SUDO_USER=vpsuser with an authorized_keys
 setup_v1_home() {
-    mkdir -p "$tmp/v1/uberhome/.ssh"
-    cat > "$tmp/v1/uberhome/.ssh/authorized_keys" <<EOF
+    mkdir -p "$tmp/v1/vpsuserhome/.ssh"
+    cat > "$tmp/v1/vpsuserhome/.ssh/authorized_keys" <<EOF
 # a comment
 ssh-ed25519 AAAACLIENT1ONE client1@host
 ssh-rsa AAAACLIENT2TWO client2@host
@@ -112,11 +112,11 @@ EOF
 setup_v1_home
 
 echo "Test: VPS reads existing client keys when present"
-out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v1/dev" \
+out="$(SUDO_USER=vpsuser SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v1/dev" \
     SERVERINATOR_SSH_KEY_DIR="$tmp/v1/keys" \
     SERVERINATOR_VPS_IP=203.0.113.5 \
     bash -c 'source "$1"
-             getent() { printf "uber:x:1000:1000::'"$tmp"'/v1/uberhome:/bin/sh\n"; }
+             getent() { printf "vpsuser:x:1000:1000::'"$tmp"'/v1/vpsuserhome:/bin/sh\n"; }
              DEVICE_NAME=rn9p; SSH_ENABLED=1; CLIENT_KEYS_MODE=existing
              setup_vps_ssh_keys
              printf "COUNT=%s\nNEW=%s\nVPSPUB=%s\nUSER=%s\n" \
@@ -125,16 +125,16 @@ out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v1/dev" \
 assert_contains "$out" "COUNT=2" "two existing keys selected"
 assert_contains "$out" "NEW=0" "not marked new"
 assert_contains "$out" "VPSPUB=ssh-ed25519 " "VPS->phone key generated"
-assert_contains "$out" "USER=uber" "invoking user detected"
+assert_contains "$out" "USER=vpsuser" "invoking user detected"
 assert_file_exists "$tmp/v1/keys/vps_to_phone" "VPS->phone key on disk"
 assert_file_exists "$tmp/v1/keys/vps_to_phone.pub" "VPS->phone pubkey on disk"
 
 echo "Test: VPS generates a client key when none exist"
-out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v2/dev" \
+out="$(SUDO_USER=vpsuser SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v2/dev" \
     SERVERINATOR_SSH_KEY_DIR="$tmp/v2/keys" \
     SERVERINATOR_VPS_IP=203.0.113.5 \
     bash -c 'source "$1"
-             getent() { printf "uber:x:1000:1000::'"$tmp"'/v2/uberhome:/bin/sh\n"; }
+             getent() { printf "vpsuser:x:1000:1000::'"$tmp"'/v2/vpsuserhome:/bin/sh\n"; }
              DEVICE_NAME=rn9p; SSH_ENABLED=1; CLIENT_KEYS_MODE=new
              PHONE_WG_IP='"${TEST_PHONE_IP}"'; SSH_PHONE_PORT=2222
              setup_vps_ssh_keys
@@ -148,22 +148,22 @@ assert_file_exists "$tmp/v2/keys/owner_rn9p" "generated private key stored"
 assert_file_exists "$tmp/v2/keys/owner_rn9p.pub" "generated public key stored"
 
 echo "Test: SSH disabled on phone skips VPS key setup"
-out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v3/dev" \
+out="$(SUDO_USER=vpsuser SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v3/dev" \
     SERVERINATOR_SSH_KEY_DIR="$tmp/v3/keys" \
     bash -c 'source "$1"; SSH_ENABLED=0; setup_vps_ssh_keys; echo DONE' _ "$VPS_SCRIPT" 2>&1)"
 assert_contains "$out" "skipping" "skips when disabled"
 assert_not_contains "$out" "authorized_keys" "does not read keys file"
 
 # ── VPS: back-handoff carries SSH block ───────
-mkdir -p "$tmp/v4/uberhome/.ssh"
-echo "ssh-ed25519 AAAACLIENT1ONE client1@host" > "$tmp/v4/uberhome/.ssh/authorized_keys"
+mkdir -p "$tmp/v4/vpsuserhome/.ssh"
+echo "ssh-ed25519 AAAACLIENT1ONE client1@host" > "$tmp/v4/vpsuserhome/.ssh/authorized_keys"
 
 echo "Test: back-handoff carries SSH fields"
-out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v4/dev" \
+out="$(SUDO_USER=vpsuser SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/v4/dev" \
     SERVERINATOR_SSH_KEY_DIR="$tmp/v4/keys" \
     SERVERINATOR_VPS_IP=203.0.113.5 \
     bash -c 'source "$1"
-             getent() { printf "uber:x:1000:1000::'"$tmp"'/v4/uberhome:/bin/sh\n"; }
+             getent() { printf "vpsuser:x:1000:1000::'"$tmp"'/v4/vpsuserhome:/bin/sh\n"; }
              DEVICE_NAME=rn9p; SSH_ENABLED=1; SSH_USER=root; SSH_PHONE_PORT=2222
              PHONE_WG_PUBKEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
              PHONE_WG_IP='"${TEST_PHONE_IP}"'
@@ -182,14 +182,14 @@ assert_contains "$out" '"ssh_host_fingerprint"' "fingerprint field present"
 
 # ── VPS: client setup script (existing vs new) ─
 run_snippet() { # $1 = existing|new
-    SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/s/dev" \
+    SUDO_USER=vpsuser SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/s/dev" \
     SERVERINATOR_SSH_KEY_DIR="$tmp/s/keys" \
     SERVERINATOR_VPS_IP=203.0.113.5 \
         bash -c 'source "$1"
-                 getent() { printf "uber:x:1000:1000::'"$tmp"'/v4/uberhome:/bin/sh\n"; }
+                 getent() { printf "vpsuser:x:1000:1000::'"$tmp"'/v4/vpsuserhome:/bin/sh\n"; }
                  DEVICE_NAME=rn9p; SSH_ENABLED=1; SSH_USER=root
                  SSH_PHONE_PORT=2222; SSH_ALIAS=serverinated
-                 PHONE_WG_IP='"${TEST_PHONE_IP}"'; VPS_IP=203.0.113.5; SSH_VPS_USER=uber
+                 PHONE_WG_IP='"${TEST_PHONE_IP}"'; VPS_IP=203.0.113.5; SSH_VPS_USER=vpsuser
                  SSH_HOST_FINGERPRINT=SHA256:PHONE
                  CLIENT_KEYS_MODE="'"$1"'"
                  setup_vps_ssh_keys >/dev/null
@@ -203,7 +203,7 @@ assert_contains "$out" "Host serverinated" "default alias host block"
 assert_contains "$out" "HostName ${TEST_PHONE_IP}" "phone tunnel address"
 assert_contains "$out" "Port 2222" "phone sshd port"
 assert_contains "$out" "User root" "root user"
-assert_contains "$out" "ProxyJump uber@203.0.113.5" "proxy jump"
+assert_contains "$out" "ProxyJump vpsuser@203.0.113.5" "proxy jump"
 assert_contains "$out" "ServerAliveInterval 60" "ssh keepalive interval"
 assert_contains "$out" "ServerAliveCountMax 9999" "ssh keepalive count"
 assert_contains "$out" "ssh serverinated" "connect hint"

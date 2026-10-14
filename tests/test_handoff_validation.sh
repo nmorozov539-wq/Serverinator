@@ -28,7 +28,7 @@ DEVICE_NAME=phone; PHONE_WG_PUBKEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 setup_wireguard > "$tmp/out" 2>&1
 VPS_IP=203.0.113.5 generate_back_handoff > "$tmp/out" 2>&1
 assert_eq 600 "$(stat -c %a "$BACK_HANDOFF_PATH")" 'back handoff private permissions'
-SSH_ENABLED=1; SSH_VPS_USER=uber; VPS_IP=203.0.113.5; SSH_ALIAS=serverinated
+SSH_ENABLED=1; SSH_VPS_USER=vpsuser; VPS_IP=203.0.113.5; SSH_ALIAS=serverinated
 CLIENT_KEYS_MODE=new setup_vps_ssh_keys > "$tmp/out" 2>&1
 generate_client_setup > "$tmp/out2" 2>&1
 assert_not_contains "$(cat "$SSH_KEY_DIR/client-setup-owner-phone.sh")" 'PRIVATE KEY' 'private key never printed'

@@ -10,7 +10,7 @@ source "$VPS_SCRIPT"
 set +e
 
 echo "Test: sudo invocation publishes back-handoff to the invoking user"
-SUDO_USER=uber
+SUDO_USER=vpsuser
 id() {
     case "$1" in
         -u) printf '%s\n' 1234 ;;

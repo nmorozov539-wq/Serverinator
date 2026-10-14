@@ -25,9 +25,9 @@ printf 'ssh-ed25519 AAAACLIENT1ONE windows@host\r\n' > "$tmp/authorized_keys"
 # setup_vps_ssh_keys strips \r from authorized_keys lines; the key should be accepted
 # and stored without CR in the back-handoff.
 # We pre-populate the "user home" authorized_keys that setup_vps_ssh_keys reads.
-mkdir -p "$tmp/keys" "$tmp/uberhome/.ssh"
-cp "$tmp/authorized_keys" "$tmp/uberhome/.ssh/authorized_keys"
-out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/dev" \
+mkdir -p "$tmp/keys" "$tmp/vpsuserhome/.ssh"
+cp "$tmp/authorized_keys" "$tmp/vpsuserhome/.ssh/authorized_keys"
+out="$(SUDO_USER=vpsuser SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/dev" \
     SERVERINATOR_SSH_KEY_DIR="$tmp/keys" \
     SERVERINATOR_VPS_IP=203.0.113.5 \
     bash -c 'source "$1"
@@ -38,7 +38,7 @@ out="$(SUDO_USER=uber SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/dev" \
              CLIENT_KEYS_MODE=existing
              VPS_IP=203.0.113.5
              # Point getent-based lookup at our stub home
-             getent() { printf "uber:x:1000:1000::'"$tmp"'/uberhome:/bin/bash\n"; }
+             getent() { printf "vpsuser:x:1000:1000::'"$tmp"'/vpsuserhome:/bin/bash\n"; }
              setup_vps_ssh_keys >/dev/null
              generate_back_handoff >/dev/null' _ "$VPS_SCRIPT" 2>&1)"
 rc=$?
