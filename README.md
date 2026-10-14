@@ -60,8 +60,9 @@ sshd inside a Linux chroot on the phone
 1. **Get the files onto the phone** (e.g. `adb push`, or clone the repo
    inside Termux) and get a root shell there.
 
-2. **Run the installer** and answer its three questions (VPS address,
-   a name for this device, an SSH alias):
+2. **Run the installer** and answer its questions (VPS address,
+   a name for this device, an SSH alias, and whether the chroot's `/tmp`
+   lives in RAM or on disk):
 
    ```
    bash serverinator.sh
@@ -73,12 +74,15 @@ sshd inside a Linux chroot on the phone
    > device; `find / -maxdepth 3 -name bash 2>/dev/null` will locate it).
    > Everything the script calls after that self-heals its own `PATH`.
 
-3. **First run is expected to stop and ask you to authorize a key.** The
-   phone generates its own identity for talking to the VPS and has no way
-   to bootstrap trust on its own — it'll print a public key and ask you to
-   add it to the VPS's `authorized_keys`. Do that, then run step 2 again
-   with the same answers. This time it should complete all the way
-   through, including a final connectivity check.
+3. **Let it authorize itself on the VPS.** The phone generates its own
+   key for talking to the VPS and gets it into `authorized_keys` the
+   cheapest way that works: a key already on the phone that the VPS
+   accepts, then a password login if the server allows one. If neither
+   works, it offers manual routes: `adb` from a computer, a short `curl`
+   over Wi-Fi, or typing the key in short checked chunks into your
+   provider's web console. Passwords are never stored, and failed logins
+   are capped so fail2ban-style bans aren't tripped. Once the key works,
+   the install carries on through to a final connectivity check.
 
 4. **Reboot the phone.** The installer only *writes* the autostart
    scripts — Magisk only runs them at boot. Give it a minute or two after
@@ -123,6 +127,23 @@ scp your-vps:/etc/wireguard/serverinator/ssh/client-setup-LABEL-DEVICE.sh . \
 ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --revoke-client LABEL'
 ```
 
+**See who has access:**
+
+```
+ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --list-clients'
+```
+
+**Several phones on one VPS.** Run the installer on each phone with its
+own device name; each gets its own tunnel address and client entries.
+Client commands act on the only phone, or on the one you name with
+`--device NAME` once there are several:
+
+```
+ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --list-devices'
+ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --add-client LABEL --device NAME'
+ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --remove-device NAME'
+```
+
 **Uninstall.** On the phone (removes the chroot and autostart scripts;
 `--purge` also deletes the persisted SSH host key, giving you a fully
 fresh identity on the next install):
@@ -154,6 +175,12 @@ ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --uninstall'
 - `wstunnel`'s server is started with `--restrict-to`, so it only ever
   forwards to the local WireGuard listener — without it, anyone who found
   the port could use it as an open proxy.
+- The phone's SSH host key travels with the install and is pinned on the
+  VPS and in every generated client script, so a client that reaches the
+  wrong machine refuses to connect instead of asking you to trust it.
+- The Ubuntu base image and the `wstunnel` binary are checked against
+  pinned SHA-256 hashes before use, and an interrupted rootfs extraction
+  is detected and redone rather than half-used.
 
 ## Testing
 
@@ -163,10 +190,11 @@ bash tests/run_tests.sh
 
 Runs the full local regression suite — no real phone or VPS required.
 Everything is exercised against mocked chroots, systemd units, and SSH
-calls. 19 test files, covering install/uninstall, address allocation,
+calls. 29 test files, covering install/uninstall, address allocation,
 handoff validation, the generated Magisk scripts' actual shell syntax,
-and the client add/revoke flow including the VPS-side access restriction
-above.
+the client add/revoke/list flow including the VPS-side access
+restriction above, VPS authorization, several phones per VPS, and host
+key pinning.
 
 ## Known limitations and roadmap
 
@@ -180,18 +208,10 @@ a private backlog.
   `client-setup-*.sh` script is bash. It runs natively on Linux and
   Termux; on Windows there's no native `.ps1` equivalent yet, so you need
   one of those two compatibility layers in the meantime.
-- **The first-time VPS authorization step is manual.** The installer
-  can't bootstrap trust on its own (see Quickstart step 3) — you have to
-  copy one key by hand, once, per VPS. If you already have *some* access
-  to that VPS, this could in principle be automated; it isn't yet.
-- **`/tmp` inside the phone's chroot is not tmpfs.** It's a normal
-  directory on persistent storage, never cleaned — anything that writes
-  temp files there (package managers, long-running processes) will slowly
-  accumulate garbage with nothing to clear it. A size-capped tmpfs mount
-  is the known fix; it isn't wired in yet, partly because the right
-  default (RAM-backed vs. disk-backed-with-a-cleaner) depends on how much
-  RAM you're willing to dedicate, and that should probably be a choice at
-  install time rather than a silent default.
+- **The tunnel can take a couple of minutes to come up after a reboot.**
+  The autostart scripts wait for the phone's network before starting, and
+  on some boots that wait runs long. It does come up on its own; if
+  `ssh` says "No route to host" right after a reboot, give it a minute.
 - **Everything is root-only.** There's no concept yet of a lower-privilege
   user inside the chroot, or of giving a client limited access instead of
   full root. Every added client gets the same level of access the owner
@@ -199,10 +219,6 @@ a private backlog.
 
 ### Not yet built
 
-- **No way to see who currently has access** short of reading
-  `authorized_keys` by hand and looking for the `serverinator:client:`
-  markers. A `--list-clients` command is the obvious fix and hasn't been
-  written yet.
 - **No alerting if the tunnel goes down.** The only way to find out the
   VPS died, or the tunnel dropped, is to try to connect and notice it
   failing. A lightweight watchdog pushing a notification on a missed
@@ -224,7 +240,7 @@ a private backlog.
   phone-side reconfiguration, and might make the traffic blend in better
   on networks that specifically distrust self-signed TLS.
 - **Startup ordering inside the Magisk scripts is poll-based, not
-  event-driven.** Each of the three autostart scripts waits on a
+  event-driven.** Each of the autostart scripts waits on a
   dependency by checking every couple of seconds, up to a timeout, then
   proceeds regardless. It works, and each script's own crash-recovery
   loop papers over most of the awkwardness, but it's not elegant and
@@ -234,14 +250,6 @@ a private backlog.
   `[INFO]`/`[1/5]`-style log lines. Nothing wrong with them, but a little
   more visual structure would make a multi-minute install feel less like
   staring at a log file.
-- **No fast, low-overhead login diagnostics.** A short "here's your
-  tunnel's health" banner on login would be nice, but needs to be built
-  carefully — naive implementations that shell out to `grep`/`awk` per
-  check can add many seconds to every single login on a phone, especially
-  from inside a chroot.
-
-If you want to pick any of these up, this list is intentionally specific
-enough to start from.
 
 ## License
 
