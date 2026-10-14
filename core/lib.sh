@@ -23,14 +23,57 @@ export PATH
 unset _si_dir
 
 # ── Logging ────────────────────────────────────
+#
+# Tags stay plain text ("[INFO]", "[ERROR]", ...) so logs remain greppable;
+# colour only wraps them. Colour is on when stdout is a terminal, unless
+# NO_COLOR is set or TERM=dumb. SERVERINATOR_COLOR=always|never overrides
+# (the orchestrator passes "always" to the VPS, whose ssh session has no tty).
 
-info()  { echo "[INFO]  $*"; }
-warn()  { echo "[WARN]  $*"; }
-error() { echo "[ERROR] $*" >&2; }
+_si_color_init() {
+    local mode="${SERVERINATOR_COLOR:-auto}" on=0
+    case "$mode" in
+        always) on=1 ;;
+        never)  on=0 ;;
+        *) [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]] && on=1 ;;
+    esac
+    if [[ "$on" == 1 ]]; then
+        C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_RED=$'\e[31m'
+        C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_BLUE=$'\e[34m' C_CYAN=$'\e[36m'
+    else
+        C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_CYAN=''
+    fi
+    SI_COLOR_ON="$on"
+}
+_si_color_init
+
+info()  { echo "${C_BLUE}[INFO]${C_RESET}  $*"; }
+warn()  { echo "${C_YELLOW}[WARN]${C_RESET}  $*"; }
+error() { echo "${C_RED}${C_BOLD}[ERROR]${C_RESET} $*" >&2; }
 die()   { error "$*"; exit 1; }
-dev()   { echo "[DEV]   $*"; }
-ok()    { echo "[OK]    $*"; }
-fail()  { echo "[FAIL]  $*" >&2; }
+dev()   { echo "${C_DIM}[DEV]   $*${C_RESET}"; }
+ok()    { echo "${C_GREEN}[OK]${C_RESET}    $*"; }
+fail()  { echo "${C_RED}[FAIL]${C_RESET}  $*" >&2; }
+
+# section N/M TITLE — a top-level stage of the orchestrator. Sized for a
+# phone terminal (38 columns).
+section() {
+    local rule="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "${C_CYAN}${rule}${C_RESET}"
+    echo "${C_BOLD}${C_CYAN} [$1]${C_RESET}${C_BOLD} $2${C_RESET}"
+    echo "${C_CYAN}${rule}${C_RESET}"
+}
+
+# step N/M TITLE — a step inside core-phone.sh / core-vps.sh.
+step() {
+    echo ""
+    echo "${C_BOLD}── [$1] $2${C_RESET}"
+}
+
+# Elapsed time since the script started, e.g. "3m07s".
+elapsed() {
+    printf '%dm%02ds' $((SECONDS / 60)) $((SECONDS % 60))
+}
 
 # ── Utilities ──────────────────────────────────
 
@@ -216,8 +259,10 @@ validate_optional_ports() {
 
 # ── SSH ────────────────────────────────────────
 
-# Returns 0 if the string is a public key with no authorized_keys options.
+# Returns 0 if the string is a single-line public key with no
+# authorized_keys options.
 is_plain_pubkey() {
+    [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || return 1
     [[ "$1" =~ ^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-[a-z0-9]+|sk-(ssh-ed25519|ecdsa-sha2-[a-z0-9]+)@openssh.com)[[:space:]]+[A-Za-z0-9+/=]+ ]]
 }
 
@@ -229,6 +274,44 @@ ssh_key_fingerprint() {
     printf '%s\n' "$key" > "$tmp"
     ssh-keygen -lf "$tmp" 2>/dev/null | awk '{print $2" "$3}' || true
     rm -f "$tmp"
+}
+
+# ── Download checksums ─────────────────────────
+#
+# SHA-256 of every file the scripts download, copied from the publishers'
+# own lists (Ubuntu's SHA256SUMS, wstunnel's checksums.txt). Bumping a
+# version means adding its hashes here; an unknown file is refused.
+
+pinned_sha256() {
+    case "$1" in
+        ubuntu-base-24.04.4-base-arm64.tar.gz) echo 04207713ece899c3740823d33690441ad3a7f0ded1101aca744e2b0f37ac7ff2 ;;
+        ubuntu-base-24.04.4-base-armhf.tar.gz) echo 991520b47f6586f38a78505cf016e300b6191bb8ff86a0723481ec23a37ab7f4 ;;
+        ubuntu-base-24.04.4-base-amd64.tar.gz) echo c1e67ef7b17a6300e136118bd1dc04725009cb376c1aad10abcf8cd453628d58 ;;
+        wstunnel_11.0.0_linux_arm64.tar.gz)    echo b86abf73e340ed0c3ff9a77a5458aa27213784920ec65513132b36def45edc94 ;;
+        wstunnel_11.0.0_linux_armv7.tar.gz)    echo 50e2855b527869b77402a902b58b83872ddd24271550df289b54729836c8abbc ;;
+        wstunnel_11.0.0_linux_amd64.tar.gz)    echo 9708a99717b5a951453c2ff7c14c25d3418d02ca7fcb96fdb382a8f2083bab5e ;;
+        *) return 1 ;;
+    esac
+}
+
+sha256_of() {
+    local out
+    if have_cmd sha256sum; then out="$(sha256sum "$1")"
+    elif have_cmd shasum; then out="$(shasum -a 256 "$1")"
+    elif have_cmd openssl; then out="$(openssl dgst -sha256 -r "$1")"
+    else die "No SHA-256 tool found (sha256sum, shasum or openssl)"
+    fi
+    printf '%s\n' "${out%%[ *]*}"
+}
+
+# verify_download FILE NAME — dies unless FILE has NAME's pinned hash.
+verify_download() {
+    local file="$1" name="$2" want got
+    want="$(pinned_sha256 "$name")" || die "No pinned checksum for $name; refusing to install it"
+    got="$(sha256_of "$file")"
+    [[ "$got" == "$want" ]] \
+        || die "Checksum mismatch for $name (expected $want, got ${got:-nothing}). The download is incomplete or not the published file."
+    info "Checksum OK: $name"
 }
 
 # ── Safe removal ───────────────────────────────

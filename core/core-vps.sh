@@ -6,9 +6,15 @@ set -euo pipefail
 #
 # Usage:
 #   bash core-vps.sh HANDOFF.json --vps-ip HOST [--alias NAME] [--client-keys existing|new]
-#   bash core-vps.sh --verify BACK-HANDOFF.json
+#   bash core-vps.sh --verify [BACK-HANDOFF.json] [--device NAME]
 #   bash core-vps.sh --add-client LABEL     # after install, the tunnel must be up
 #   bash core-vps.sh --revoke-client LABEL
+#   bash core-vps.sh --list-clients [--device NAME]
+#   bash core-vps.sh --list-devices
+#   bash core-vps.sh --remove-device NAME
+#
+# --add-client/--revoke-client/--list-clients/--verify act on the only phone,
+# or on the one named with --device when several share this VPS.
 #   bash core-vps.sh --uninstall
 # ─────────────────────────────────────────────
 
@@ -42,16 +48,22 @@ WG_KEY_DIR="${SERVERINATOR_WG_KEY_DIR:-$WG_DIR/serverinator}"
 WG_CONF="$WG_DIR/${WG_INTERFACE}.conf"
 SYSTEMD_DIR="${SERVERINATOR_SYSTEMD_DIR:-/etc/systemd/system}"
 WSTUNNEL_BIN="${SERVERINATOR_WSTUNNEL_BIN:-/usr/local/bin/wstunnel}"
-BACK_HANDOFF_PATH="${SERVERINATOR_BACK_HANDOFF_PATH:-/tmp/back-handoff.json}"
+# Optional extra copy of the back-handoff (DEV and tests set it). The real
+# record is DEVICES_DIR/<device>.json.
+BACK_HANDOFF_PATH="${SERVERINATOR_BACK_HANDOFF_PATH:-}"
 IPTABLES_RULES_PATH="${SERVERINATOR_IPTABLES_RULES_PATH:-/etc/iptables/rules.v4}"
 
 # ── SSH state ─────────────────────────────────
 SSH_KEY_DIR="${SERVERINATOR_SSH_KEY_DIR:-$WG_KEY_DIR/ssh}"
+# One record per phone (its back-handoff): the source of truth for
+# --add-client, --verify, --list-devices and the orchestrator.
+DEVICES_DIR="${SERVERINATOR_DEVICES_DIR:-$WG_KEY_DIR/devices}"
 SSH_ALIAS_DEFAULT="serverinated"
 SSH_ENABLED=0
 SSH_USER="root"
 SSH_PHONE_PORT=22
 SSH_HOST_FINGERPRINT=""
+SSH_HOST_PUBKEY=""
 SSH_VPS_USER=""
 SSH_VPS_TO_PHONE_PUBKEY=""
 SSH_CLIENT_KEYS=()
@@ -65,9 +77,14 @@ VPS_IP=""
 SSH_ALIAS=""
 CLIENT_KEYS_MODE=""
 CLIENT_LABEL=""
+SELECTED_DEVICE=""   # --device / --remove-device
+DEVICE_RECORD=""     # DEVICES_DIR/<device>.json once selected
 
 # ── Shared library ────────────────────────────
-source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# Resolved once at the top level: inside a function, the phone's bash gave
+# BASH_SOURCE without its directory (hardware run 2026-10-14).
+CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$CORE_DIR/lib.sh"
 
 # Validate immediately on load — WG_PORT/WSTUNNEL_PORT can come from env vars
 # set by the caller, and must never reach a generated config or firewall rule
@@ -86,8 +103,21 @@ parse_args() {
             --uninstall) MODE="uninstall"; shift ;;
             --verify)
                 MODE="verify"; shift
-                [[ $# -gt 0 ]] || die "--verify requires a path to back-handoff.json"
-                BACK_HANDOFF_FILE="$1"; shift
+                # Optional file; without it the device record is used.
+                if [[ $# -gt 0 && "$1" != -* ]]; then BACK_HANDOFF_FILE="$1"; shift; fi
+                ;;
+            --device)
+                shift
+                [[ $# -gt 0 ]] || die "--device requires a NAME"
+                SELECTED_DEVICE="$1"; shift
+                validate_device_name "$SELECTED_DEVICE"
+                ;;
+            --list-devices) MODE="list-devices"; shift ;;
+            --remove-device)
+                MODE="remove-device"; shift
+                [[ $# -gt 0 ]] || die "--remove-device requires a NAME"
+                SELECTED_DEVICE="$1"; shift
+                validate_device_name "$SELECTED_DEVICE"
                 ;;
             --add-client)
                 MODE="add-client"; shift
@@ -101,6 +131,7 @@ parse_args() {
                 CLIENT_LABEL="$1"; shift
                 validate_client_label "$CLIENT_LABEL"
                 ;;
+            --list-clients) MODE="list-clients"; shift ;;
             --vps-ip)
                 shift
                 [[ $# -gt 0 ]] || die "--vps-ip requires a value"
@@ -139,11 +170,7 @@ parse_args() {
             validate_host "$VPS_IP"
             [[ -n "$SSH_ALIAS" ]] || SSH_ALIAS="$SSH_ALIAS_DEFAULT"
             ;;
-        verify)
-            [[ -n "$BACK_HANDOFF_FILE" ]] \
-                || die "--verify requires a path to back-handoff.json"
-            ;;
-        uninstall) ;;
+        verify|uninstall|list-clients|list-devices|remove-device) ;;
         add-client|revoke-client)
             [[ -n "$CLIENT_LABEL" ]] || die "--add-client/--revoke-client requires a LABEL"
             ;;
@@ -170,6 +197,89 @@ set_back_handoff_owner() {
     [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] \
         || die "Invalid uid/gid for $SUDO_USER"
     chown "$uid:$gid" "$path" || die "Could not hand back-handoff to $SUDO_USER"
+}
+
+# ─────────────────────────────────────────────
+# Device records
+# ─────────────────────────────────────────────
+
+device_record_path() { printf '%s/%s.json\n' "$DEVICES_DIR" "$1"; }
+
+device_names() {
+    local f
+    for f in "$DEVICES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        f="${f##*/}"; printf '%s\n' "${f%.json}"
+    done
+}
+
+# Older installs kept one ssh/state.json (and only when SSH was enabled).
+# Move it to DEVICES_DIR/<device>.json unless a record already exists.
+migrate_legacy_state() {
+    local legacy="$SSH_KEY_DIR/state.json" name record
+    [[ -f "$legacy" ]] || return 0
+    name="$(json_get "$legacy" device_name)" || return 0
+    if [[ -z "$name" ]] || ! (validate_device_name "$name") 2>/dev/null; then
+        warn "Ignoring $legacy: no valid device_name"
+        return 0
+    fi
+    record="$(device_record_path "$name")"
+    mkdir -p "$DEVICES_DIR"; chmod 700 "$DEVICES_DIR"
+    if [[ -f "$record" ]]; then
+        rm -f "$legacy"
+    else
+        mv "$legacy" "$record"
+        chmod 600 "$record"
+        info "Moved $legacy -> $record"
+    fi
+}
+
+# Sets DEVICE_NAME/DEVICE_RECORD from --device, or the only phone installed.
+select_device() {
+    local -a names=()
+    mapfile -t names < <(device_names)
+    if [[ -n "$SELECTED_DEVICE" ]]; then
+        DEVICE_RECORD="$(device_record_path "$SELECTED_DEVICE")"
+        [[ -f "$DEVICE_RECORD" ]] \
+            || die "No phone named '$SELECTED_DEVICE' on this VPS (known: ${names[*]:-none})"
+        DEVICE_NAME="$SELECTED_DEVICE"
+        return 0
+    fi
+    case "${#names[@]}" in
+        0) die "No phone is set up on this VPS yet ($DEVICES_DIR is empty) — run a full install first: bash $0 HANDOFF.json --vps-ip HOST" ;;
+        1) DEVICE_NAME="${names[0]}" ;;
+        *) die "Several phones use this VPS: ${names[*]}. Choose one with --device NAME" ;;
+    esac
+    DEVICE_RECORD="$(device_record_path "$DEVICE_NAME")"
+}
+
+# Owner and --add-client public keys issued for DEVICE (one path per line).
+# Client keys are owner_<device>_<label>.pub; files that belong to another
+# device whose name starts with "<device>_" are excluded.
+device_client_pubs() { # DEVICE
+    local dev="$1" f base other skip
+    local -a others=()
+    mapfile -t others < <(device_names)
+    for f in "$SSH_KEY_DIR/owner_${dev}_"*.pub; do
+        [[ -f "$f" ]] || continue
+        base="${f##*/}"; skip=0
+        for other in "${others[@]}"; do
+            [[ "$other" != "$dev" && "$other" == "${dev}_"* ]] || continue
+            [[ "$base" == "owner_${other}.pub" || "$base" == "owner_${other}_"* ]] && skip=1
+        done
+        ((skip)) || printf '%s\n' "$f"
+    done
+}
+
+# Device names that would make owner_<a>_<label> ambiguous are refused.
+check_device_name_unambiguous() {
+    local name="$1" other
+    while IFS= read -r other; do
+        [[ -n "$other" && "$other" != "$name" ]] || continue
+        if [[ "$other" == "${name}_"* || "$name" == "${other}_"* ]]; then
+            die "Device name '$name' clashes with existing phone '$other' (one is the other plus '_...'). Pick another name."
+        fi
+    done < <(device_names)
 }
 
 # ─────────────────────────────────────────────
@@ -254,13 +364,16 @@ read_handoff() {
     SSH_USER="$(json_get        "$HANDOFF_FILE" ssh_user)";       SSH_USER="${SSH_USER:-root}"
     SSH_PHONE_PORT="$(json_get_num "$HANDOFF_FILE" ssh_port)";   SSH_PHONE_PORT="${SSH_PHONE_PORT:-22}"
     SSH_HOST_FINGERPRINT="$(json_get "$HANDOFF_FILE" ssh_host_fingerprint)"
+    SSH_HOST_PUBKEY="$(json_get "$HANDOFF_FILE" ssh_host_pubkey)"
 
     [[ -n "$DEVICE_NAME" ]]     || die "handoff.json: missing device_name"
     [[ -n "$PHONE_WG_PUBKEY" ]] || die "handoff.json: missing wg_pubkey"
 
     validate_device_name "$DEVICE_NAME"
+    check_device_name_unambiguous "$DEVICE_NAME"
     validate_wg_key "$PHONE_WG_PUBKEY"
     validate_optional_ports "$HANDOFF_FILE"
+    validate_phone_host_key
 
     info "Handoff OK — device: $DEVICE_NAME"
     info "Phone's WireGuard pubkey: $PHONE_WG_PUBKEY"
@@ -284,11 +397,23 @@ install_deps() {
     apt-get install -y -qq wireguard-tools iproute2 iputils-ping curl openssh-client jq
 }
 
+# wstunnel release suffix for this VPS's CPU (SERVERINATOR_VPS_ARCH overrides
+# uname -m, for tests).
+wstunnel_vps_suffix() {
+    local raw="${SERVERINATOR_VPS_ARCH:-$(uname -m)}"
+    case "$raw" in
+        x86_64|amd64)   echo amd64 ;;
+        aarch64|arm64)  echo arm64 ;;
+        armv7l|armv8l)  echo armv7 ;;
+        *) die "No wstunnel binary for VPS architecture: $raw" ;;
+    esac
+}
+
 install_wstunnel_vps() (
     # Check both presence AND version — a mismatched version gets upgraded.
     if [[ -x "$WSTUNNEL_BIN" ]]; then
         local current
-        current="$("$WSTUNNEL_BIN" --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1 || true)"
+        current="$("$WSTUNNEL_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
         if [[ "$current" == "$WSTUNNEL_VERSION" ]]; then
             info "wstunnel v${WSTUNNEL_VERSION} already installed — skipping"
             return 0
@@ -312,12 +437,15 @@ STUB
 
     require_cmd curl
     require_cmd tar
+    local suffix
+    suffix="$(wstunnel_vps_suffix)"
     local scratch
     scratch="$(mktemp -d)"
     trap 'rm -rf "$scratch"' EXIT
-    local url="https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_amd64.tar.gz"
-    info "Installing wstunnel v${WSTUNNEL_VERSION}..."
+    local url="https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}/wstunnel_${WSTUNNEL_VERSION}_linux_${suffix}.tar.gz"
+    info "Installing wstunnel v${WSTUNNEL_VERSION} (${suffix})..."
     curl -fsSL "$url" -o "$scratch/wstunnel.tar.gz"
+    verify_download "$scratch/wstunnel.tar.gz" "${url##*/}"
     tar -xf "$scratch/wstunnel.tar.gz" -C "$scratch" wstunnel
     mkdir -p "$(dirname "$WSTUNNEL_BIN")"
     mv "$scratch/wstunnel" "$WSTUNNEL_BIN"
@@ -434,9 +562,8 @@ setup_wireguard() {
           inside && $1=="MTU"         { if(!seen[$1]++) print "MTU = 1280";           next }
           { print }
           END { if(inside) missing() }
-        ' "$desired" | reconcile_file "$WG_CONF" 600
-        # The pipe runs reconcile_file in a subshell — RECONCILED_CHANGED does
-        # not propagate out. The runtime check below always runs regardless.
+        ' "$desired" > "$desired.new" && mv "$desired.new" "$desired"
+        reconcile_file "$WG_CONF" 600 < "$desired"
     else
         cat > "$desired" << EOF
 [Interface]
@@ -553,7 +680,11 @@ fix_pmtu_clamp() {
     printf '%s\n' "$WSTUNNEL_PORT" > "$receipt"
 
     if [[ -f "$IPTABLES_RULES_PATH" ]]; then
-        iptables-save | reconcile_file "$IPTABLES_RULES_PATH" 600
+        local saved
+        saved="$(mktemp)"
+        iptables-save > "$saved" || { rm -f "$saved"; die "iptables-save failed"; }
+        reconcile_file "$IPTABLES_RULES_PATH" 600 < "$saved"
+        rm -f "$saved"
         info "iptables-save updated"
     else
         warn "File $IPTABLES_RULES_PATH not found — the rule is not persistent"
@@ -608,8 +739,14 @@ _revoke_vps_jump_key() {
     auth_file="$user_home/.ssh/authorized_keys"
     [[ -f "$auth_file" ]] || return 0
     line="$(_vps_jump_key_line "$pub" "$phone_ip" "$phone_port")"
-    grep -vFx -- "$line" "$auth_file" > "${auth_file}.new"
-    mv "${auth_file}.new" "$auth_file"
+    local tmp rc=0
+    tmp="$(mktemp "${auth_file}.XXXXXX")" || die "Could not create a temp file next to $auth_file"
+    # grep -v exits 1 when no lines remain; that is a valid (empty) result.
+    grep -vFx -- "$line" "$auth_file" > "$tmp" || rc=$?
+    if [[ "$rc" -gt 1 ]]; then rm -f "$tmp"; die "Could not rewrite $auth_file"; fi
+    chmod 600 "$tmp"
+    chown --reference="$auth_file" "$tmp" 2>/dev/null || true
+    mv "$tmp" "$auth_file" || { rm -f "$tmp"; die "Could not replace $auth_file"; }
 }
 
 setup_vps_ssh_keys() {
@@ -691,6 +828,54 @@ setup_vps_ssh_keys() {
 }
 
 # ─────────────────────────────────────────────
+# Host keys (review #13)
+# ─────────────────────────────────────────────
+#
+# The phone's handoff carries its ed25519 host key. The VPS pins it for its
+# own connections, and client scripts pin both it and the VPS's host key,
+# so no connection has to trust whatever answers first.
+
+# Checks the handoff's host key: a plain ed25519 key that matches the
+# fingerprint shown on the phone. Older phones send none, which is allowed.
+validate_phone_host_key() {
+    [[ -n "${SSH_HOST_PUBKEY:-}" ]] || return 0
+    is_plain_pubkey "$SSH_HOST_PUBKEY" && [[ "$SSH_HOST_PUBKEY" == "ssh-ed25519 "* ]] \
+        || die "handoff.json: ssh_host_pubkey is not an ed25519 public key"
+    if [[ -n "${SSH_HOST_FINGERPRINT:-}" ]] && have_cmd ssh-keygen; then
+        local fp
+        fp="$(ssh_key_fingerprint "$SSH_HOST_PUBKEY")"
+        [[ "$fp" == *"$SSH_HOST_FINGERPRINT"* ]] \
+            || die "handoff.json: ssh_host_pubkey doesn't match ssh_host_fingerprint"
+    fi
+}
+
+phone_known_hosts_file() { printf '%s/known_hosts_%s\n' "$SSH_KEY_DIR" "$1"; }
+
+# phone_hostkey_opts DEVICE PUBKEY — fills the caller's `opts` array.
+# With a pinned key: strict checking against a file holding only that key.
+# Without one (a phone set up before pinning): trust on first use, but in a
+# per-phone file so one phone's key can't stand in for another's.
+phone_hostkey_opts() {
+    local device="$1" pubkey="$2" file
+    file="$(phone_known_hosts_file "$device")"
+    if [[ -n "$pubkey" ]]; then
+        printf 'serverinator-%s %s\n' "$device" "$pubkey" > "$file"
+        chmod 600 "$file"
+        opts=(-o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$file" -o "HostKeyAlias=serverinator-$device")
+    else
+        opts=(-o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$file")
+    fi
+}
+
+# The VPS's own ed25519 host key (type and key), for the clients' jump hop.
+vps_host_pubkey() {
+    local f="${SERVERINATOR_VPS_HOSTKEY_FILE:-/etc/ssh/ssh_host_ed25519_key.pub}" key
+    [[ -r "$f" ]] || return 0
+    key="$(awk '{print $1" "$2; exit}' "$f")"
+    is_plain_pubkey "$key" && printf '%s\n' "$key"
+}
+
+# ─────────────────────────────────────────────
 # Step 5: Generate client-setup.sh
 # ─────────────────────────────────────────────
 
@@ -752,6 +937,23 @@ _write_client_setup_script() {
             "")"
     fi
 
+    # Host keys to pin on the client: the phone's under the alias name
+    # (HostKeyAlias, so phones on different VPSes that share a tunnel IP
+    # don't collide), and the VPS's under its address for the jump hop.
+    local hka_line="" known_hosts_lines="" vps_key entry entries=()
+    if [[ -n "${SSH_HOST_PUBKEY:-}" ]]; then
+        hka_line="    printf '    HostKeyAlias ${alias}\\n' >> \"\$CONFIG\""$'\n'
+        entries+=("${alias} ${SSH_HOST_PUBKEY}")
+    fi
+    vps_key="$(vps_host_pubkey)"
+    [[ -z "$vps_key" ]] || entries+=("${VPS_IP} ${vps_key}")
+    if (( ${#entries[@]} )); then
+        known_hosts_lines="KNOWN=\"\$HOME/.ssh/known_hosts\""$'\n'"touch \"\$KNOWN\" && chmod 600 \"\$KNOWN\""
+        for entry in "${entries[@]}"; do
+            known_hosts_lines+=$'\n'"grep -qxF '${entry}' \"\$KNOWN\" || { echo '${entry}' >> \"\$KNOWN\"; echo \"Pinned host key for ${entry%% *}\"; }"
+        done
+    fi
+
     # Generate the script. Values are substituted NOW (at generation time).
     # \$ and \$HOME below are literal $ for runtime expansion inside the
     # generated script.
@@ -780,12 +982,13 @@ else
     printf '    User ${SSH_USER}\\n' >> "\$CONFIG"
     printf '    ${id_line:+IdentityFile ~/.ssh/${si_name}\\n}' >> "\$CONFIG"
     printf '    ProxyJump ${jump}\\n' >> "\$CONFIG"
-    printf '    ServerAliveInterval 60\\n' >> "\$CONFIG"
+${hka_line}    printf '    ServerAliveInterval 60\\n' >> "\$CONFIG"
     printf '    ServerAliveCountMax 9999\\n' >> "\$CONFIG"
     echo "Alias '${alias}' added to ~/.ssh/config"
 fi
 
 ${jump_host_lines}
+${known_hosts_lines}
 echo ""
 echo "Done. Connect with:  ssh ${alias}"
 SETUP_EOF
@@ -803,6 +1006,17 @@ generate_client_setup() {
     OWNER_CLIENT_SETUP_PATH="$f"
 }
 
+# One-line command to fetch a root-only file from this VPS onto another
+# device and run it: scp as root, or `sudo cat` for a sudo user.
+fetch_hint() { # PATH
+    local name="${1##*/}" user="${SSH_VPS_USER:-root}"
+    if [[ "$user" == root ]]; then
+        printf '%s' "scp root@${VPS_IP}:$1 . && bash $name"
+    else
+        printf '%s' "ssh ${user}@${VPS_IP} 'sudo cat $1' > $name && bash $name"
+    fi
+}
+
 # ─────────────────────────────────────────────
 # --add-client / --revoke-client
 # ─────────────────────────────────────────────
@@ -817,9 +1031,8 @@ generate_client_setup() {
 # (generate_back_handoff). --add-client/--revoke-client don't go through
 # read_handoff, so this is the only source for this data.
 _load_phone_state() {
-    local state="$SSH_KEY_DIR/state.json"
-    [[ -f "$state" ]] \
-        || die "Phone state not found ($state) — run a full install first: bash $0 HANDOFF.json --vps-ip HOST"
+    select_device
+    local state="$DEVICE_RECORD"
 
     DEVICE_NAME="$(json_get "$state" device_name)"
     VPS_IP="$(json_get "$state" vps_ip)"
@@ -827,25 +1040,37 @@ _load_phone_state() {
     SSH_USER="$(json_get "$state" ssh_user)"; SSH_USER="${SSH_USER:-root}"
     SSH_PHONE_PORT="$(json_get_num "$state" ssh_port)"; SSH_PHONE_PORT="${SSH_PHONE_PORT:-22}"
     SSH_VPS_USER="$(json_get "$state" ssh_vps_user)"; SSH_VPS_USER="${SSH_VPS_USER:-$(id -un)}"
+    SSH_HOST_PUBKEY="$(json_get "$state" ssh_host_pubkey)"
+    SSH_HOST_FINGERPRINT="$(json_get "$state" ssh_host_fingerprint)"
+    # The alias chosen at install time names the per-client aliases too
+    # (ALIAS-LABEL). An explicit --alias still wins.
+    if [[ -z "$SSH_ALIAS" ]]; then
+        SSH_ALIAS="$(json_get "$state" ssh_alias)"
+        [[ -z "$SSH_ALIAS" ]] || validate_ssh_alias "$SSH_ALIAS"
+    fi
     local ssh_enabled
     ssh_enabled="$(json_get_num "$state" ssh_enabled)"
 
-    [[ -n "$DEVICE_NAME" ]] || die "state.json: missing device_name"
+    [[ -n "$DEVICE_NAME" ]] || die "$state: missing device_name"
     validate_device_name "$DEVICE_NAME"
-    [[ -n "$VPS_IP" ]] || die "state.json: missing vps_ip"
+    [[ "$state" == "$(device_record_path "$DEVICE_NAME")" ]] || die "$state names device '$DEVICE_NAME'"
+    [[ -n "$VPS_IP" ]] || die "$state: missing vps_ip"
     validate_host "$VPS_IP"
     [[ "$ssh_enabled" == "1" ]] \
         || die "SSH was not enabled when the phone was set up — cannot add clients"
-    [[ -n "$PHONE_WG_IP" ]] || die "state.json: missing ssh_phone_ip"
+    [[ -n "$PHONE_WG_IP" ]] || die "$state: missing ssh_phone_ip"
     validate_ipv4 "$PHONE_WG_IP" "phone WG IPv4"
     validate_port "$SSH_PHONE_PORT"
+    validate_phone_host_key
 }
 
 # Runs a command on the phone over the up tunnel, using the VPS->phone key.
 _phone_ssh() {
     local vps_key="$SSH_KEY_DIR/vps_to_phone"
     [[ -f "$vps_key" ]] || die "VPS->phone key not found ($vps_key)"
-    ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+    local opts=()
+    phone_hostkey_opts "$DEVICE_NAME" "$SSH_HOST_PUBKEY"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "${opts[@]}" \
         -i "$vps_key" -p "$SSH_PHONE_PORT" "${SSH_USER}@${PHONE_WG_IP}" "$@"
 }
 
@@ -884,7 +1109,7 @@ add_client() {
     echo ""
     echo "  Client script for '${CLIENT_LABEL}': $f"
     echo "  To connect from that device:"
-    echo "    scp ${SSH_VPS_USER}@${VPS_IP}:${f} . && bash $(basename "$f")"
+    echo "    $(fetch_hint "$f")"
     echo ""
 }
 
@@ -902,8 +1127,10 @@ revoke_client() {
         [ -f ~/.ssh/authorized_keys ] || { echo 0; exit 0; }
         key="$(cat)"
         before=$(grep -cFx -- "$key" ~/.ssh/authorized_keys || true)
-        grep -vFx -- "$key" ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.new
-        mv ~/.ssh/authorized_keys.new ~/.ssh/authorized_keys
+        tmp=$(mktemp ~/.ssh/authorized_keys.XXXXXX)
+        grep -vFx -- "$key" ~/.ssh/authorized_keys > "$tmp" || [ $? -eq 1 ]
+        chmod 600 "$tmp"
+        mv "$tmp" ~/.ssh/authorized_keys
         echo "$before"
     ')" || die "Could not revoke the client key on the phone — is the tunnel up?"
 
@@ -918,14 +1145,48 @@ revoke_client() {
     info "Local files for client '${CLIENT_LABEL}' removed"
 }
 
+# Lists who has SSH access to the phone, from the keys kept on this VPS. Works
+# without the tunnel; it shows what the VPS issued, not a live read of the
+# phone's authorized_keys.
+list_clients() {
+    _load_phone_state
+    local alias="${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}" f label fp created count=0
+
+    _list_client_row() { # LABEL ALIAS PUBFILE
+        fp="$(ssh_key_fingerprint "$(cat "$3")")"
+        created="$(date -u -r "$3" +%Y-%m-%d 2>/dev/null || echo '?')"
+        printf '  %-16s %-24s %-10s %s\n' "$1" "$2" "$created" "${fp:-?}"
+    }
+
+    echo ""
+    echo "  SSH access to ${DEVICE_NAME} (via ${VPS_IP})"
+    echo ""
+    printf '  %-16s %-24s %-10s %s\n' LABEL ALIAS CREATED FINGERPRINT
+    if [[ -f "$SSH_KEY_DIR/owner_${DEVICE_NAME}.pub" ]]; then
+        _list_client_row owner "$alias" "$SSH_KEY_DIR/owner_${DEVICE_NAME}.pub"
+    else
+        printf '  %-16s %s\n' owner "(your existing VPS keys; installed with --client-keys existing)"
+    fi
+    while IFS= read -r f; do
+        label="${f##*/owner_${DEVICE_NAME}_}"; label="${label%.pub}"
+        validate_client_label "$label"
+        _list_client_row "$label" "${alias}-${label}" "$f"
+        count=$((count + 1))
+    done < <(device_client_pubs "$DEVICE_NAME")
+    echo ""
+    info "${count} extra client(s). Add: --add-client LABEL   Remove: --revoke-client LABEL"
+}
+
 # ─────────────────────────────────────────────
 # Step 6: Back-handoff
 # ─────────────────────────────────────────────
 
 generate_back_handoff() {
-    local staged
-    mkdir -p "$(dirname "$BACK_HANDOFF_PATH")"
-    staged="$(mktemp "${BACK_HANDOFF_PATH}.XXXXXX")"
+    local staged record
+    record="$(device_record_path "$DEVICE_NAME")"
+    mkdir -p "$DEVICES_DIR"
+    chmod 700 "$DEVICES_DIR"
+    staged="$(mktemp "${record}.XXXXXX")"
     chmod 600 "$staged"
 
     # Base fields (always present)
@@ -979,6 +1240,7 @@ generate_back_handoff() {
             --arg     ssh_vps_user          "$SSH_VPS_USER" \
             --arg     ssh_vps_to_phone_pubkey "$SSH_VPS_TO_PHONE_PUBKEY" \
             --arg     ssh_host_fingerprint  "${SSH_HOST_FINGERPRINT:-}" \
+            --arg     ssh_host_pubkey       "${SSH_HOST_PUBKEY:-}" \
             --argjson ssh_client_key_count  "${#SSH_CLIENT_KEYS[@]}" \
             '$base + {
                 ssh_enabled:              $ssh_enabled,
@@ -989,6 +1251,7 @@ generate_back_handoff() {
                 ssh_vps_user:             $ssh_vps_user,
                 ssh_vps_to_phone_pubkey:  $ssh_vps_to_phone_pubkey,
                 ssh_host_fingerprint:     $ssh_host_fingerprint,
+                ssh_host_pubkey:          $ssh_host_pubkey,
                 ssh_client_key_count:     $ssh_client_key_count
             } + $keys')" || die "jq: could not add SSH fields"
     else
@@ -999,18 +1262,20 @@ generate_back_handoff() {
     printf '%s\n' "$result" > "$staged"
     jq -e . < "$staged" > /dev/null || die "Back-handoff failed jq validation"
 
-    [[ ! -L "$BACK_HANDOFF_PATH" ]] || die "Rejected a symlink for back-handoff"
-    mv "$staged" "$BACK_HANDOFF_PATH"
-    # Persistent copy for future --add-client/--revoke-client (which don't go
-    # through read_handoff and don't get HANDOFF.json again). Only needed
-    # when SSH is enabled — without it, adding clients is pointless.
-    if [[ "$SSH_ENABLED" == "1" ]]; then
-        cp "$BACK_HANDOFF_PATH" "$SSH_KEY_DIR/state.json" \
-            || die "Could not save state for future --add-client/--revoke-client"
-        chmod 600 "$SSH_KEY_DIR/state.json"
+    [[ ! -L "$record" ]] || die "Rejected a symlink for $record"
+    mv "$staged" "$record"
+    info "Device record written: $record"
+    # The single legacy state file is superseded by the record.
+    rm -f "$SSH_KEY_DIR/state.json"
+
+    if [[ -n "$BACK_HANDOFF_PATH" ]]; then
+        [[ ! -L "$BACK_HANDOFF_PATH" ]] || die "Rejected a symlink for back-handoff"
+        mkdir -p "$(dirname "$BACK_HANDOFF_PATH")"
+        cp "$record" "$BACK_HANDOFF_PATH"
+        chmod 600 "$BACK_HANDOFF_PATH"
+        set_back_handoff_owner "$BACK_HANDOFF_PATH"
+        info "Back-handoff copy written: $BACK_HANDOFF_PATH"
     fi
-    set_back_handoff_owner "$BACK_HANDOFF_PATH"
-    info "Back-handoff written: $BACK_HANDOFF_PATH"
 }
 
 # ─────────────────────────────────────────────
@@ -1018,6 +1283,10 @@ generate_back_handoff() {
 # ─────────────────────────────────────────────
 
 verify() {
+    if [[ -z "$BACK_HANDOFF_FILE" ]]; then
+        select_device
+        BACK_HANDOFF_FILE="$DEVICE_RECORD"
+    fi
     [[ -f "$BACK_HANDOFF_FILE" ]] || die "Back-handoff not found: $BACK_HANDOFF_FILE"
 
     local version
@@ -1055,7 +1324,7 @@ verify() {
     elif ! have_cmd wg; then
         fail "wg not found (install wireguard-tools)"; ((errors++)) || true
     else
-        local hs_line hs_count last_hs age
+        local hs_line hs_count age
         hs_line="$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null \
             | awk -v key="$phone_wg_pubkey" '$1 == key { print $2 }')"
         hs_count="$(printf '%s\n' "$hs_line" | grep -c . || true)"
@@ -1114,11 +1383,13 @@ verify() {
         elif [[ "$DEV" == "1" ]]; then
             ok "SSH data transfer (skipped in DEV)"
         else
-            local ssh_out
+            local ssh_out opts=()
+            phone_hostkey_opts "$(json_get "$BACK_HANDOFF_FILE" device_name)" \
+                "$(json_get "$BACK_HANDOFF_FILE" ssh_host_pubkey)"
             ssh_out="$(ssh \
                 -o BatchMode=yes \
                 -o ConnectTimeout=10 \
-                -o StrictHostKeyChecking=no \
+                "${opts[@]}" \
                 -i "$vps_key" \
                 -p "$ssh_port_bh" \
                 "${ssh_user_bh}@${phone_wg_ip}" \
@@ -1144,8 +1415,117 @@ verify() {
 }
 
 # ─────────────────────────────────────────────
+# --list-devices / --remove-device
+# ─────────────────────────────────────────────
+
+list_devices() {
+    local -a names=()
+    local name record ip ssh_on clients hs age="" now
+    mapfile -t names < <(device_names)
+    echo ""
+    if ((${#names[@]} == 0)); then
+        info "No phone is set up on this VPS yet."
+        return 0
+    fi
+    now="$(date +%s)"
+    printf '  %-20s %-14s %-5s %-8s %s\n' DEVICE TUNNEL-IP SSH CLIENTS LAST-HANDSHAKE
+    for name in "${names[@]}"; do
+        record="$(device_record_path "$name")"
+        ip="$(json_get "$record" phone_wg_ip 2>/dev/null || echo '?')"
+        ssh_on="$(json_get_num "$record" ssh_enabled 2>/dev/null || echo 0)"
+        clients="$(device_client_pubs "$name" | grep -c . || true)"
+        hs="?"
+        if [[ "$DEV" != 1 ]] && have_cmd wg; then
+            age="$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null \
+                | awk -v key="$(json_get "$record" phone_wg_pubkey 2>/dev/null)" '$1 == key {print $2}')"
+            if [[ "$age" =~ ^[0-9]+$ ]]; then
+                if ((age == 0)); then hs="never"; else hs="$((now - age))s ago"; fi
+            fi
+        fi
+        printf '  %-20s %-14s %-5s %-8s %s\n' "$name" "${ip:-?}" "$([[ "$ssh_on" == 1 ]] && echo yes || echo no)" "$clients" "$hs"
+    done
+    echo ""
+}
+
+# Removes one phone: its WireGuard peer (config and live), its record, the
+# owner/client keys and setup scripts issued for it, and their VPS jump
+# entries. Other phones are untouched.
+remove_device() {
+    local name="$SELECTED_DEVICE" record lock_fd desired pubkey="" phone_ip="" port="" f
+    [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--remove-device requires root"
+    record="$(device_record_path "$name")"
+    if [[ ! -f "$record" ]] && ! { [[ -f "$WG_CONF" ]] && [[ "$(peer_block_count "$WG_CONF" "$name")" -gt 0 ]]; }; then
+        die "No phone named '$name' on this VPS (known: $(device_names | tr '\n' ' '))"
+    fi
+    if [[ -f "$record" ]]; then
+        phone_ip="$(json_get "$record" ssh_phone_ip)"
+        port="$(json_get_num "$record" ssh_port)"
+    fi
+
+    # WireGuard peer, under the same lock as setup.
+    if [[ -f "$WG_CONF" ]]; then
+        mkdir -p "$WG_KEY_DIR"
+        exec {lock_fd}>"$WG_KEY_DIR/setup.lock"
+        flock -x "$lock_fd"
+        if [[ "$(peer_block_count "$WG_CONF" "$name")" -gt 0 ]]; then
+            pubkey="$(peer_pubkey_for_device "$WG_CONF" "$name")"
+            desired="$(mktemp "$WG_DIR/desired.XXXXXX")"
+            cp "$WG_CONF" "$desired"
+            peer_remove_device "$desired" "$name"
+            reconcile_file "$WG_CONF" 600 < "$desired"
+            rm -f "$desired"
+            info "Removed the WireGuard peer for $name"
+        fi
+        flock -u "$lock_fd"
+        exec {lock_fd}>&-
+        if [[ "$DEV" != 1 && -n "$pubkey" ]] && interface_is_up; then
+            wg set "$WG_INTERFACE" peer "$pubkey" remove || warn "Could not remove the live peer; it goes at the next restart"
+        fi
+    fi
+
+    # Keys issued for this phone and their restricted jump entries.
+    while IFS= read -r f; do
+        [[ -n "$phone_ip" && -n "$port" ]] && _revoke_vps_jump_key "$(cat "$f")" "$phone_ip" "$port"
+        rm -f "${f%.pub}" "$f"
+    done < <( { [[ -f "$SSH_KEY_DIR/owner_${name}.pub" ]] && echo "$SSH_KEY_DIR/owner_${name}.pub"; device_client_pubs "$name"; } )
+    rm -f "$SSH_KEY_DIR/client-setup-owner-${name}.sh" "$SSH_KEY_DIR"/client-setup-*-"${name}".sh
+    rm -f "$record"
+    info "Phone '$name' removed from this VPS."
+    [[ -n "$(device_names)" ]] || info "No phones left; the VPS services stay installed (use --uninstall to remove everything)."
+}
+
+# ─────────────────────────────────────────────
 # Uninstall
 # ─────────────────────────────────────────────
+
+# Removes every restricted jump entry we added (all phones) from the
+# authorized_keys of each VPS admin the records name, plus the current one.
+_remove_all_vps_jump_entries() {
+    local prefix="command=\"echo 'ServerInator: forwarding-only key, no shell access'; exit 1\",restrict,port-forwarding,permitopen="
+    local homes=() home rec user auth_file tmp rc
+    home="$(_vps_user_home 2>/dev/null || true)"; [[ -z "$home" ]] || homes+=("$home")
+    for rec in "$DEVICES_DIR"/*.json "$SSH_KEY_DIR/state.json"; do
+        [[ -f "$rec" ]] || continue
+        user="$(json_get "$rec" ssh_vps_user 2>/dev/null || true)"
+        [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || continue
+        if [[ "$user" == root ]]; then home="${SERVERINATOR_VPS_ADMIN_HOME:-/root}"
+        else home="$(getent passwd "$user" | cut -d: -f6 || true)"; fi
+        [[ -z "$home" ]] || homes+=("$home")
+    done
+    for home in $(printf '%s\n' "${homes[@]}" | sort -u); do
+        auth_file="$home/.ssh/authorized_keys"
+        [[ -f "$auth_file" && ! -L "$auth_file" ]] || continue
+        grep -qF -- "$prefix" "$auth_file" || continue
+        tmp="$(mktemp "${auth_file}.XXXXXX")" || die "Could not create a temp file next to $auth_file"
+        rc=0
+        awk -v p="$prefix" 'index($0, p) != 1' "$auth_file" > "$tmp" || rc=$?
+        [[ "$rc" == 0 ]] || { rm -f "$tmp"; die "Could not rewrite $auth_file"; }
+        chmod 600 "$tmp"
+        chown --reference="$auth_file" "$tmp" 2>/dev/null || true
+        mv "$tmp" "$auth_file" || { rm -f "$tmp"; die "Could not replace $auth_file"; }
+        info "Removed ServerInator jump entries from $auth_file"
+    done
+}
 
 uninstall_vps() {
     safe_remove_path "$WG_KEY_DIR"
@@ -1163,9 +1543,40 @@ uninstall_vps() {
     else
         warn "wstunnel was not installed by us — not removing the binary"
     fi
+    _remove_all_vps_jump_entries
     rm -rf "$WG_KEY_DIR"
     [[ "$DEV" != 1 ]] && systemctl daemon-reload
+    # The orchestrator keeps these scripts in /root/.serverinator/bin. Bash
+    # has this file open already, so removing it doesn't stop the run.
+    local bin_dir
+    bin_dir="$(cd "$CORE_DIR" && pwd -P)"
+    if [[ "$DEV" != 1 && "$bin_dir" == /root/.serverinator/bin ]]; then
+        rm -f "$bin_dir"/core-vps.sh "$bin_dir"/lib.sh
+        rmdir "$bin_dir" /root/.serverinator 2>/dev/null || true
+        info "Removed the scripts in $bin_dir"
+    fi
     info "VPS uninstalled. Foreign interfaces and firewall rules were preserved."
+}
+
+# Warns when a host firewall would drop the tunnel port (review #17). It
+# never changes firewall rules: the admin decides.
+check_firewall() {
+    local port="$WSTUNNEL_PORT" hint=""
+    if have_cmd ufw && ufw status 2>/dev/null | head -1 | grep -q '^Status: active'; then
+        ufw status 2>/dev/null | grep -qE "^${port}(/tcp)?[[:space:]].*ALLOW" \
+            || hint="ufw allow ${port}/tcp"
+    elif have_cmd firewall-cmd && firewall-cmd --state &>/dev/null; then
+        firewall-cmd --query-port="${port}/tcp" &>/dev/null \
+            || hint="firewall-cmd --permanent --add-port=${port}/tcp && firewall-cmd --reload"
+    elif have_cmd iptables && iptables -S INPUT 2>/dev/null | grep -qx -- '-P INPUT DROP'; then
+        iptables -S INPUT 2>/dev/null | grep -qE -- "--dport ${port}( |$)" \
+            || hint="iptables -I INPUT -p tcp --dport ${port} -j ACCEPT (and save it)"
+    fi
+    if [[ -n "$hint" ]]; then
+        warn "A firewall on this VPS seems to block TCP port ${port}, which the tunnel needs."
+        warn "  Open it with:  $hint"
+        warn "  (Also check your provider's firewall or security group.)"
+    fi
 }
 
 remove_owned_mss() {
@@ -1187,11 +1598,15 @@ remove_owned_mss() {
                 -j TCPMSS --set-mss 500
         done
         if [[ -f "$IPTABLES_RULES_PATH" ]]; then
+            local rules
+            rules="$(mktemp)"
             awk -v port="$port" '
               {line=$0; gsub(/"/, "", line)}
               line=="-A OUTPUT -p tcp -m tcp --sport "port" --tcp-flags SYN,RST SYN -m comment --comment serverinator-mss -j TCPMSS --set-mss 500" {next}
               line=="-A OUTPUT -p tcp -m tcp --sport "port" --tcp-flags RST,SYN SYN -m comment --comment serverinator-mss -j TCPMSS --set-mss 500" {next}
-              {print}' "$IPTABLES_RULES_PATH" | reconcile_file "$IPTABLES_RULES_PATH" 600
+              {print}' "$IPTABLES_RULES_PATH" > "$rules"
+            reconcile_file "$IPTABLES_RULES_PATH" 600 < "$rules"
+            rm -f "$rules"
         fi
     done
 }
@@ -1202,12 +1617,16 @@ remove_owned_mss() {
 
 main() {
     parse_args "$@"
+    [[ "$MODE" == uninstall ]] || migrate_legacy_state
 
     case "$MODE" in
         uninstall)      uninstall_vps;  return ;;
+        list-devices)   list_devices;   return ;;
+        remove-device)  remove_device;  return ;;
         verify)         verify;         return ;;
         add-client)     add_client;     return ;;
         revoke-client)  revoke_client;  return ;;
+        list-clients)   list_clients;   return ;;
     esac
 
     # MODE=setup
@@ -1216,32 +1635,33 @@ main() {
 
     have_cmd jq || die "Install jq: apt-get install jq"
 
-    info "[1/6] Reading handoff..."
+    step 1/6 "Reading handoff"
     read_handoff
 
-    info "[2/6] Installing dependencies..."
+    step 2/6 "Installing dependencies"
     install_deps
     install_wstunnel_vps
 
-    info "[3/6] Setting up WireGuard..."
+    step 3/6 "Setting up WireGuard"
     setup_wireguard
 
-    info "[4/6] Setting up wstunnel..."
+    step 4/6 "Setting up wstunnel"
     setup_wstunnel_server
     fix_pmtu_clamp
+    [[ "$DEV" == 1 ]] || check_firewall
 
-    info "[5/6] SSH keys and client script..."
+    step 5/6 "SSH keys and client script"
     setup_vps_ssh_keys
     generate_client_setup
 
-    info "[6/6] Generating back-handoff..."
+    step 6/6 "Generating back-handoff"
     generate_back_handoff
 
     info "VPS configured."
     if [[ -n "${OWNER_CLIENT_SETUP_PATH:-}" ]]; then
         echo ""
         echo "  To connect from any device:"
-        echo "    scp ${SSH_VPS_USER}@${VPS_IP}:${OWNER_CLIENT_SETUP_PATH} . && bash $(basename "${OWNER_CLIENT_SETUP_PATH}")"
+        echo "    $(fetch_hint "$OWNER_CLIENT_SETUP_PATH")"
         echo ""
     fi
 }
