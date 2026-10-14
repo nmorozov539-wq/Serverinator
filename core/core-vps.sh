@@ -12,6 +12,10 @@ set -euo pipefail
 #   bash core-vps.sh --list-clients [--device NAME]
 #   bash core-vps.sh --list-devices
 #   bash core-vps.sh --remove-device NAME
+#   bash core-vps.sh --set-domain DOMAIN [--acme-email EMAIL | --tls-cert FILE --tls-key FILE]
+#   bash core-vps.sh --remove-domain       # back to the built-in self-signed certificate
+#
+# A full install also takes --domain DOMAIN [--acme-email EMAIL | --tls-cert FILE --tls-key FILE].
 #
 # --add-client/--revoke-client/--list-clients/--verify act on the only phone,
 # or on the one named with --device when several share this VPS.
@@ -41,6 +45,7 @@ if [[ "$DEV" == "1" ]]; then
     : "${SERVERINATOR_WSTUNNEL_BIN:=$DEV_ROOT/usr/local/bin/wstunnel}"
     : "${SERVERINATOR_BACK_HANDOFF_PATH:=$DEV_ROOT/back-handoff.json}"
     : "${SERVERINATOR_VPS_ADMIN_HOME:=$DEV_ROOT/root}"
+    : "${SERVERINATOR_LETSENCRYPT_DIR:=$DEV_ROOT/etc/letsencrypt}"
 fi
 
 WG_DIR="${SERVERINATOR_WG_DIR:-/etc/wireguard}"
@@ -52,9 +57,13 @@ WSTUNNEL_BIN="${SERVERINATOR_WSTUNNEL_BIN:-/usr/local/bin/wstunnel}"
 # record is DEVICES_DIR/<device>.json.
 BACK_HANDOFF_PATH="${SERVERINATOR_BACK_HANDOFF_PATH:-}"
 IPTABLES_RULES_PATH="${SERVERINATOR_IPTABLES_RULES_PATH:-/etc/iptables/rules.v4}"
+# Let's Encrypt (certbot) layout; tests point it elsewhere.
+LETSENCRYPT_DIR="${SERVERINATOR_LETSENCRYPT_DIR:-/etc/letsencrypt}"
+CERTBOT="${SERVERINATOR_CERTBOT:-certbot}"
 
 # ── SSH state ─────────────────────────────────
 SSH_KEY_DIR="${SERVERINATOR_SSH_KEY_DIR:-$WG_KEY_DIR/ssh}"
+TLS_STATE="$WG_KEY_DIR/tls.json"
 # One record per phone (its back-handoff): the source of truth for
 # --add-client, --verify, --list-devices and the orchestrator.
 DEVICES_DIR="${SERVERINATOR_DEVICES_DIR:-$WG_KEY_DIR/devices}"
@@ -79,6 +88,19 @@ CLIENT_KEYS_MODE=""
 CLIENT_LABEL=""
 SELECTED_DEVICE=""   # --device / --remove-device
 DEVICE_RECORD=""     # DEVICES_DIR/<device>.json once selected
+
+# ── Domain and certificate (optional) ─────────
+# Without a domain, wstunnel serves its built-in self-signed certificate and
+# everything addresses the VPS by VPS_IP. With one, wstunnel serves a real
+# certificate for it, phones connect to it by name (real SNI), and client
+# configs jump through it, so moving to another VPS becomes a DNS change.
+# The choice is VPS-wide and kept in TLS_STATE.
+VPS_DOMAIN=""
+ACME_EMAIL=""
+TLS_CERT_FILE=""     # your own certificate instead of Let's Encrypt
+TLS_KEY_FILE=""
+TLS_SOURCE=""        # letsencrypt|custom
+REMOVE_DOMAIN=0
 
 # ── Shared library ────────────────────────────
 # Resolved once at the top level: inside a function, the phone's bash gave
@@ -132,6 +154,27 @@ parse_args() {
                 validate_client_label "$CLIENT_LABEL"
                 ;;
             --list-clients) MODE="list-clients"; shift ;;
+            --domain|--set-domain)
+                [[ "$1" == --set-domain ]] && MODE="set-domain"
+                shift
+                [[ $# -gt 0 ]] || die "--domain requires a DOMAIN"
+                VPS_DOMAIN="${1,,}"; shift
+                validate_domain "$VPS_DOMAIN"
+                ;;
+            --remove-domain) MODE="set-domain"; REMOVE_DOMAIN=1; shift ;;
+            --acme-email)
+                shift
+                [[ $# -gt 0 ]] || die "--acme-email requires an address"
+                ACME_EMAIL="$1"; shift
+                validate_email "$ACME_EMAIL"
+                ;;
+            --tls-cert|--tls-key)
+                local which="$1"; shift
+                [[ $# -gt 0 ]] || die "$which requires a FILE"
+                [[ "$1" =~ ^/[A-Za-z0-9_./@+-]+$ && "$1" != *..* ]] || die "$which: use an absolute path without unusual characters"
+                if [[ "$which" == --tls-cert ]]; then TLS_CERT_FILE="$1"; else TLS_KEY_FILE="$1"; fi
+                shift
+                ;;
             --vps-ip)
                 shift
                 [[ $# -gt 0 ]] || die "--vps-ip requires a value"
@@ -155,6 +198,11 @@ parse_args() {
         esac
     done
 
+    [[ -z "$TLS_CERT_FILE$TLS_KEY_FILE" || ( -n "$TLS_CERT_FILE" && -n "$TLS_KEY_FILE" ) ]] \
+        || die "--tls-cert and --tls-key go together"
+    [[ -z "$TLS_CERT_FILE" || -n "$VPS_DOMAIN" ]] || die "--tls-cert needs --domain (the name the certificate is for)"
+    [[ -z "$TLS_CERT_FILE" || -z "$ACME_EMAIL" ]] || die "--acme-email is for Let's Encrypt; it doesn't go with --tls-cert"
+
     case "$MODE" in
         setup)
             [[ -n "$HANDOFF_FILE" ]] \
@@ -171,6 +219,9 @@ parse_args() {
             [[ -n "$SSH_ALIAS" ]] || SSH_ALIAS="$SSH_ALIAS_DEFAULT"
             ;;
         verify|uninstall|list-clients|list-devices|remove-device) ;;
+        set-domain)
+            [[ "$REMOVE_DOMAIN" == 1 || -n "$VPS_DOMAIN" ]] || die "--set-domain requires a DOMAIN"
+            ;;
         add-client|revoke-client)
             [[ -n "$CLIENT_LABEL" ]] || die "--add-client/--revoke-client requires a LABEL"
             ;;
@@ -600,10 +651,258 @@ EOF
 # Step 4: wstunnel server
 # ─────────────────────────────────────────────
 
+# ─────────────────────────────────────────────
+# Domain and certificate
+# ─────────────────────────────────────────────
+
+# Loads the saved choice unless this run names a domain (or removes it).
+load_tls_state() {
+    [[ "$REMOVE_DOMAIN" == 1 || -n "$VPS_DOMAIN" || ! -f "$TLS_STATE" ]] && return 0
+    VPS_DOMAIN="$(json_get "$TLS_STATE" domain)"
+    TLS_CERT_FILE="$(json_get "$TLS_STATE" cert)"
+    TLS_KEY_FILE="$(json_get "$TLS_STATE" key)"
+    TLS_SOURCE="$(json_get "$TLS_STATE" source)"
+    [[ -z "$VPS_DOMAIN" ]] || validate_domain "$VPS_DOMAIN"
+}
+
+save_tls_state() {
+    mkdir -p "$WG_KEY_DIR"; chmod 700 "$WG_KEY_DIR"
+    if [[ -z "$VPS_DOMAIN" ]]; then rm -f "$TLS_STATE"; return 0; fi
+    jq -n --arg domain "$VPS_DOMAIN" --arg cert "$TLS_CERT_FILE" --arg key "$TLS_KEY_FILE" \
+        --arg source "$TLS_SOURCE" '{domain: $domain, cert: $cert, key: $key, source: $source}' \
+        > "$TLS_STATE.tmp" || die "jq: could not write $TLS_STATE"
+    chmod 600 "$TLS_STATE.tmp"; mv "$TLS_STATE.tmp" "$TLS_STATE"
+}
+
+# The host clients and phones use to reach this VPS.
+vps_public_host() { printf '%s\n' "${VPS_DOMAIN:-$VPS_IP}"; }
+
+# IPv4 addresses DOMAIN resolves to, one per line (mocked in tests).
+resolve_domain() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u; }
+
+# This machine's own IPv4 addresses (mocked in tests).
+local_ipv4s() { ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}'; }
+
+# Something already listening on TCP port 80? (mocked in tests)
+port80_in_use() { have_cmd ss && ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; }
+
+# The systemd service that holds TCP port 80, if one does (mocked in tests).
+port80_service() {
+    local pid
+    have_cmd ss || return 0
+    pid="$(ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2)"
+    [[ -n "$pid" && -r "/proc/$pid/cgroup" ]] || return 0
+    sed -n 's|^.*/system\.slice/\([^/]*\.service\)$|\1|p' "/proc/$pid/cgroup" | head -n 1
+}
+
+# Programs listening on TCP port 80, for messages.
+port80_programs() {
+    have_cmd ss || return 0
+    ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | paste -sd, -
+}
+
+check_domain_points_here() {
+    local addrs a mine
+    addrs="$(resolve_domain "$VPS_DOMAIN")"
+    if [[ -z "$addrs" ]]; then
+        local target="$VPS_IP"
+        [[ -n "$target" ]] || target="the public IPv4 of this VPS"
+        die "$VPS_DOMAIN doesn't resolve yet.
+  Create a DNS A record:  $VPS_DOMAIN -> $target
+  then run this again (new records can take a few minutes to appear)."
+    fi
+    mine="$(local_ipv4s; [[ "$VPS_IP" =~ ^[0-9.]+$ ]] && printf '%s\n' "$VPS_IP")"
+    while IFS= read -r a; do
+        if grep -qxF -- "$a" <<< "$mine"; then
+            ok "$VPS_DOMAIN points to this VPS ($a)"
+            return 0
+        fi
+    done <<< "$addrs"
+    warn "$VPS_DOMAIN points to $(paste -sd' ' <<< "$addrs"), which isn't an address of this VPS."
+    warn "  If the VPS sits behind NAT this can be fine; otherwise fix the A record first."
+}
+
+# Checks that CERT and KEY belong together and that CERT covers VPS_DOMAIN.
+check_cert_files() {
+    [[ -r "$TLS_CERT_FILE" ]] || die "Certificate not found or not readable: $TLS_CERT_FILE"
+    [[ -r "$TLS_KEY_FILE" ]] || die "Private key not found or not readable: $TLS_KEY_FILE"
+    grep -q -- '-----BEGIN CERTIFICATE-----' "$TLS_CERT_FILE" || die "$TLS_CERT_FILE is not a PEM certificate"
+    grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$TLS_KEY_FILE" || die "$TLS_KEY_FILE is not a PEM private key"
+    if have_cmd openssl; then
+        local cert_pub key_pub
+        cert_pub="$(openssl x509 -in "$TLS_CERT_FILE" -noout -pubkey 2>/dev/null)"
+        key_pub="$(openssl pkey -in "$TLS_KEY_FILE" -pubout 2>/dev/null)"
+        [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] \
+            || die "$TLS_KEY_FILE is not the private key for $TLS_CERT_FILE"
+        openssl x509 -in "$TLS_CERT_FILE" -noout -checkhost "$VPS_DOMAIN" 2>/dev/null | grep -q 'does match' \
+            || die "$TLS_CERT_FILE is not valid for $VPS_DOMAIN"
+        openssl x509 -in "$TLS_CERT_FILE" -noout -checkend 0 > /dev/null 2>&1 \
+            || die "$TLS_CERT_FILE has expired"
+    else
+        warn "openssl not found; can't check that the certificate matches the key and $VPS_DOMAIN"
+    fi
+}
+
+# Restarts wstunnel after every renewal. wstunnel also reloads changed
+# certificate files on its own; the restart is a backstop.
+write_renewal_hook() {
+    local dir="$LETSENCRYPT_DIR/renewal-hooks/deploy"
+    mkdir -p "$dir"
+    reconcile_file "$dir/serverinator-wstunnel.sh" 755 << 'EOF'
+#!/bin/sh
+# Managed by ServerInator: pick up a renewed certificate.
+systemctl try-restart wstunnel-serverinator.service
+EOF
+}
+
+obtain_letsencrypt_cert() {
+    local live="$LETSENCRYPT_DIR/live/$VPS_DOMAIN"
+    TLS_SOURCE="letsencrypt"
+    TLS_CERT_FILE="$live/fullchain.pem"
+    TLS_KEY_FILE="$live/privkey.pem"
+
+    if [[ "$DEV" == 1 && -z "${SERVERINATOR_CERTBOT:-}" ]]; then
+        dev "DEV: skipping Let's Encrypt for $VPS_DOMAIN"
+        return 0
+    fi
+    check_domain_points_here
+
+    if [[ "$DEV" != 1 ]] && ! have_cmd "$CERTBOT"; then
+        info "Installing certbot..."
+        apt-get install -y -qq certbot || die "Could not install certbot"
+    fi
+    # certbot keeps a valid certificate as it is, so re-runs are cheap and
+    # don't touch the Let's Encrypt rate limits.
+    if [[ -s "$TLS_CERT_FILE" ]] && have_cmd openssl \
+        && openssl x509 -in "$TLS_CERT_FILE" -noout -checkend $((30 * 86400)) > /dev/null 2>&1; then
+        info "Certificate for $VPS_DOMAIN is valid for at least 30 more days, keeping it"
+    else
+        # A web server already on port 80 (say Caddy) is paused for the few
+        # seconds of each check. certbot saves the hooks, so renewals do the same.
+        local pause=""
+        if port80_in_use; then
+            pause="$(port80_service)"
+            if [[ ! "$pause" =~ ^[A-Za-z0-9@._-]+\.service$ ]]; then
+                local who
+                who="$(port80_programs)"
+                die "Something already listens on TCP port 80${who:+ ($who)}, which Let's Encrypt needs for a moment to check the domain.
+  See it with: ss -ltnp 'sport = :80'
+  It isn't a systemd service, so it can't be paused automatically. Stop it
+  during setup, or bring your own certificate:
+    --tls-cert /path/fullchain.pem --tls-key /path/privkey.pem"
+            fi
+            warn "Port 80 is used by $pause. It will be stopped for the few seconds"
+            warn "  Let's Encrypt needs, now and at each renewal, and started again right after."
+        fi
+        [[ "$DEV" == 1 ]] || check_firewall 80 "Let's Encrypt needs to reach while it checks the domain (and at every renewal)"
+        local -a args=(certonly --standalone --non-interactive --agree-tos --keep-until-expiring
+                       --preferred-challenges http -d "$VPS_DOMAIN" --cert-name "$VPS_DOMAIN")
+        [[ -z "$pause" ]] || args+=(--pre-hook "systemctl stop $pause" --post-hook "systemctl start $pause")
+        if [[ -n "$ACME_EMAIL" ]]; then args+=(--email "$ACME_EMAIL"); else args+=(--register-unsafely-without-email); fi
+        info "Requesting a Let's Encrypt certificate for $VPS_DOMAIN..."
+        "$CERTBOT" "${args[@]}" || die "certbot could not get a certificate for $VPS_DOMAIN (see the output above).
+  Usual causes: the A record points elsewhere, or port 80 is blocked by a firewall."
+    fi
+    [[ -s "$TLS_CERT_FILE" && -s "$TLS_KEY_FILE" ]] || die "certbot finished but $live has no certificate"
+    write_renewal_hook
+    ok "Certificate for $VPS_DOMAIN: $TLS_CERT_FILE"
+}
+
+# Fills TLS_* for VPS_DOMAIN (or clears them). Called by setup and --set-domain.
+setup_tls() {
+    load_tls_state
+    if [[ "$REMOVE_DOMAIN" == 1 || -z "$VPS_DOMAIN" ]]; then
+        VPS_DOMAIN=""; TLS_CERT_FILE=""; TLS_KEY_FILE=""; TLS_SOURCE=""
+        save_tls_state
+        info "No domain: wstunnel uses its built-in self-signed certificate"
+        return 0
+    fi
+    if [[ -n "$TLS_CERT_FILE" && "$TLS_SOURCE" != letsencrypt ]]; then
+        TLS_SOURCE="custom"
+        check_cert_files
+        info "Using your certificate for $VPS_DOMAIN: $TLS_CERT_FILE"
+    else
+        obtain_letsencrypt_cert
+    fi
+    save_tls_state
+}
+
+# Points every device record at the current domain (or back at the IP) and
+# rewrites the client scripts that the VPS can regenerate.
+refresh_devices_for_domain() {
+    local dev record tmp
+    for dev in $(device_names); do
+        record="$(device_record_path "$dev")"
+        tmp="$(mktemp "${record}.XXXXXX")"; chmod 600 "$tmp"
+        jq --arg d "$VPS_DOMAIN" 'if $d == "" then del(.vps_domain) else . + {vps_domain: $d} end' \
+            "$record" > "$tmp" || { rm -f "$tmp"; die "jq: could not update $record"; }
+        mv "$tmp" "$record"
+        ( SELECTED_DEVICE="$dev"; regenerate_client_scripts ) \
+            || warn "Could not rewrite the client scripts for $dev; re-run its install to refresh them"
+    done
+}
+
+# Rewrites the owner's and every --add-client script for SELECTED_DEVICE.
+regenerate_client_scripts() {
+    local domain="$VPS_DOMAIN"
+    _load_phone_state > /dev/null
+    VPS_DOMAIN="$domain"
+    local owner_alias="$SSH_ALIAS" key label f n=0
+    if [[ -f "$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh" ]]; then
+        key="$SSH_KEY_DIR/owner_${DEVICE_NAME}"
+        _write_client_setup_script "$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh" "$owner_alias" \
+            "si-${DEVICE_NAME}" "$([[ -f "$key" ]] && echo 1 || echo 0)" "$key"
+        n=$((n + 1))
+    fi
+    for f in "$SSH_KEY_DIR"/client-setup-*-"${DEVICE_NAME}".sh; do
+        [[ -e "$f" ]] || continue
+        label="${f##*/client-setup-}"; label="${label%-"${DEVICE_NAME}".sh}"
+        [[ "$label" != owner ]] || continue
+        [[ -f "$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}" ]] || continue
+        _write_client_setup_script "$f" "${owner_alias}-${label}" "si-${DEVICE_NAME}-${label}" 1 \
+            "$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}"
+        n=$((n + 1))
+    done
+    info "$DEVICE_NAME: rewrote $n client script(s)"
+}
+
+set_domain() {
+    have_cmd jq || die "Install jq: apt-get install jq"
+    [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--set-domain needs root"
+    # VPS_IP for the DNS check and the IP fallback: from any device record.
+    local first
+    first="$(device_names | head -n 1)"
+    [[ -z "$first" ]] || VPS_IP="$(json_get "$(device_record_path "$first")" vps_ip)"
+    setup_tls
+    setup_wstunnel_server
+    refresh_devices_for_domain
+    if [[ -n "$VPS_DOMAIN" ]]; then
+        local label="your own"
+        [[ "$TLS_SOURCE" != letsencrypt ]] || label="a Let's Encrypt"
+        ok "The tunnel now serves $label certificate for $VPS_DOMAIN"
+    else
+        ok "The tunnel is back on the built-in self-signed certificate"
+    fi
+    echo ""
+    echo "  Phones keep working as they are. To switch each phone over, run on it:"
+    if [[ -n "$VPS_DOMAIN" ]]; then
+        echo "    bash serverinator.sh --set-domain $VPS_DOMAIN"
+    else
+        echo "    bash serverinator.sh --remove-domain"
+    fi
+    echo "  Existing ssh setups keep working through the IP. The client scripts on"
+    echo "  the VPS now use $(vps_public_host) as the jump host for new machines."
+}
+
 setup_wstunnel_server() {
     local svc="$SYSTEMD_DIR/wstunnel-serverinator.service"
     mkdir -p "$SYSTEMD_DIR"
-    local desired
+    local desired tls_lines=""
+    if [[ -n "$VPS_DOMAIN" ]]; then
+        tls_lines="    --tls-certificate ${TLS_CERT_FILE} \\
+    --tls-private-key ${TLS_KEY_FILE} \\
+"
+    fi
     desired="$(mktemp "$SYSTEMD_DIR/unit.XXXXXX")"
     cat > "$desired" << EOF
 [Unit]
@@ -614,7 +913,7 @@ After=network.target
 ExecStart=${WSTUNNEL_BIN} server \\
     --log-lvl INFO \\
     --restrict-to ${WG_RESTRICT_TARGET} \\
-    wss://0.0.0.0:${WSTUNNEL_PORT}
+${tls_lines}    wss://0.0.0.0:${WSTUNNEL_PORT}
 Restart=on-failure
 RestartSec=5
 
@@ -890,7 +1189,8 @@ vps_host_pubkey() {
 # _load_phone_state (--add-client/--revoke-client).
 _write_client_setup_script() {
     local out="$1" alias="$2" si_name="$3" is_new="$4" key_file="$5"
-    local jump="${SSH_VPS_USER}@${VPS_IP}"
+    local vhost; vhost="$(vps_public_host)"
+    local jump="${SSH_VPS_USER}@${vhost}"
     local created
     created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -926,13 +1226,13 @@ _write_client_setup_script() {
     local jump_host_lines=""
     if [[ "$is_new" == "1" ]]; then
         jump_host_lines="$(printf '%s\n' \
-            "if grep -q \"^Host ${VPS_IP}\$\" \"\$CONFIG\" 2>/dev/null; then" \
-            "    echo \"Host ${VPS_IP} is already in \$CONFIG — skipping\"" \
+            "if grep -q \"^Host ${vhost}\$\" \"\$CONFIG\" 2>/dev/null; then" \
+            "    echo \"Host ${vhost} is already in \$CONFIG — skipping\"" \
             "else" \
-            "    printf '\\nHost ${VPS_IP}\\n' >> \"\$CONFIG\"" \
+            "    printf '\\nHost ${vhost}\\n' >> \"\$CONFIG\"" \
             "    printf '    User ${SSH_VPS_USER}\\n' >> \"\$CONFIG\"" \
             "    printf '    IdentityFile ~/.ssh/${si_name}\\n' >> \"\$CONFIG\"" \
-            "    echo \"Host ${VPS_IP} (ProxyJump only) added to \$CONFIG\"" \
+            "    echo \"Host ${vhost} (ProxyJump only) added to \$CONFIG\"" \
             "fi" \
             "")"
     fi
@@ -946,7 +1246,7 @@ _write_client_setup_script() {
         entries+=("${alias} ${SSH_HOST_PUBKEY}")
     fi
     vps_key="$(vps_host_pubkey)"
-    [[ -z "$vps_key" ]] || entries+=("${VPS_IP} ${vps_key}")
+    [[ -z "$vps_key" ]] || entries+=("${vhost} ${vps_key}")
     if (( ${#entries[@]} )); then
         known_hosts_lines="KNOWN=\"\$HOME/.ssh/known_hosts\""$'\n'"touch \"\$KNOWN\" && chmod 600 \"\$KNOWN\""
         for entry in "${entries[@]}"; do
@@ -963,7 +1263,7 @@ _write_client_setup_script() {
 # Alias: ${alias}   VPS: ${VPS_IP}   Created: ${created}
 #
 # Run this on the client device (bash; works out of the box on Linux/Termux;
-# on Windows use WSL or Git Bash):
+# on Windows run the .ps1 next to this file instead):
 #   bash $(basename "$out")
 set -euo pipefail
 echo "Setting up SSH access to ${DEVICE_NAME} (alias: ${alias})..."
@@ -994,6 +1294,114 @@ echo "Done. Connect with:  ssh ${alias}"
 SETUP_EOF
 
     chmod 600 "$out"
+    _write_client_setup_ps1 "${out%.sh}.ps1" "$alias" "$si_name" "$is_new" "$key_file" "${entries[@]+"${entries[@]}"}"
+}
+
+# _write_client_setup_ps1 OUT_FILE ALIAS SI_NAME IS_NEW KEY_FILE [KNOWN_HOSTS_ENTRY...]
+# The same setup as the bash script, for Windows PowerShell 5.1+ with the
+# built-in OpenSSH client. Kept to plain ASCII: PowerShell 5 reads a script
+# without a BOM as ANSI. Every substituted value is already validated
+# (host, alias, device name, base64), and none can contain a single quote.
+_write_client_setup_ps1() {
+    local out="$1" alias="$2" si_name="$3" is_new="$4" key_file="$5"; shift 5
+    local vhost; vhost="$(vps_public_host)"
+    local jump="${SSH_VPS_USER}@${vhost}" created entry b64=""
+    created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ "$is_new" == "1" ]] && b64="$(base64 -w 0 "$key_file")"
+
+    {
+        cat << PS1_EOF
+# ServerInator - client access to ${DEVICE_NAME} (Windows)
+# Alias: ${alias}   VPS: ${VPS_IP}   Created: ${created}
+#
+# Run in PowerShell on the Windows machine:
+#   powershell -ExecutionPolicy Bypass -File .\\$(basename "$out")
+# Needs the OpenSSH client (Settings > Apps > Optional features > OpenSSH Client).
+\$ErrorActionPreference = 'Stop'
+Write-Host 'Setting up SSH access to ${DEVICE_NAME} (alias: ${alias})...'
+if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+    Write-Warning 'ssh was not found. Install the OpenSSH Client: Settings > Apps > Optional features.'
+}
+\$SshDir = Join-Path \$env:USERPROFILE '.ssh'
+New-Item -ItemType Directory -Force -Path \$SshDir | Out-Null
+
+# Appends LINES to FILE (LF endings, no BOM), starting on a fresh line.
+function Add-Lines([string]\$File, [string[]]\$Lines) {
+    \$prefix = ''
+    if ((Test-Path \$File) -and (Get-Item \$File).Length -gt 0) {
+        \$last = [IO.File]::ReadAllBytes(\$File)[-1]
+        if (\$last -ne 10) { \$prefix = "\`n" }
+    }
+    [IO.File]::AppendAllText(\$File, \$prefix + ((\$Lines -join "\`n") + "\`n"))
+}
+function Test-Line([string]\$File, [string]\$Line) {
+    if (-not (Test-Path \$File)) { return \$false }
+    foreach (\$l in [IO.File]::ReadAllLines(\$File)) { if (\$l -ceq \$Line) { return \$true } }
+    return \$false
+}
+PS1_EOF
+        if [[ "$is_new" == "1" ]]; then
+            cat << PS1_EOF
+
+# Installing the private key (original on the VPS: ${key_file})
+\$Key = Join-Path \$SshDir '${si_name}'
+if (-not (Test-Path \$Key)) {
+    [IO.File]::WriteAllBytes(\$Key, [Convert]::FromBase64String('${b64}'))
+    if (\$IsLinux -or \$IsMacOS) {
+        chmod 600 \$Key
+    } else {
+        # OpenSSH for Windows refuses a key that anyone but its owner can read.
+        \$Sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        icacls \$Key /inheritance:r /grant:r "*\${Sid}:F" | Out-Null
+    }
+    Write-Host "Key installed: \$Key"
+} else {
+    Write-Host "Key already present: \$Key - skipping"
+}
+PS1_EOF
+        fi
+        cat << PS1_EOF
+
+\$Config = Join-Path \$SshDir 'config'
+if (Test-Line \$Config 'Host ${alias}') {
+    Write-Host "Alias '${alias}' is already in \$Config - skipping"
+} else {
+    \$block = @('', 'Host ${alias}', '    HostName ${PHONE_WG_IP}', '    Port ${SSH_PHONE_PORT}', '    User ${SSH_USER}')
+PS1_EOF
+        [[ "$is_new" == "1" ]] && echo "    \$block += '    IdentityFile ~/.ssh/${si_name}'"
+        echo "    \$block += '    ProxyJump ${jump}'"
+        [[ -n "${SSH_HOST_PUBKEY:-}" ]] && echo "    \$block += '    HostKeyAlias ${alias}'"
+        cat << PS1_EOF
+    \$block += @('    ServerAliveInterval 60', '    ServerAliveCountMax 9999')
+    Add-Lines \$Config \$block
+    Write-Host "Alias '${alias}' added to \$Config"
+}
+PS1_EOF
+        if [[ "$is_new" == "1" ]]; then
+            cat << PS1_EOF
+
+if (Test-Line \$Config 'Host ${vhost}') {
+    Write-Host "Host ${vhost} is already in \$Config - skipping"
+} else {
+    Add-Lines \$Config @('', 'Host ${vhost}', '    User ${SSH_VPS_USER}', '    IdentityFile ~/.ssh/${si_name}')
+    Write-Host 'Host ${vhost} (ProxyJump only) added to config'
+}
+PS1_EOF
+        fi
+        if (( $# )); then
+            echo ""
+            echo "\$Known = Join-Path \$SshDir 'known_hosts'"
+            for entry in "$@"; do
+                echo "if (-not (Test-Line \$Known '${entry}')) { Add-Lines \$Known @('${entry}'); Write-Host 'Pinned host key for ${entry%% *}' }"
+            done
+        fi
+        cat << PS1_EOF
+
+Write-Host ''
+Write-Host 'Done. Connect with:  ssh ${alias}'
+PS1_EOF
+    } > "$out"
+    chmod 600 "$out"
 }
 
 generate_client_setup() {
@@ -1014,6 +1422,17 @@ fetch_hint() { # PATH
         printf '%s' "scp root@${VPS_IP}:$1 . && bash $name"
     else
         printf '%s' "ssh ${user}@${VPS_IP} 'sudo cat $1' > $name && bash $name"
+    fi
+}
+
+# The same for Windows PowerShell, fetching the .ps1 next to PATH (.sh).
+fetch_hint_windows() { # PATH
+    local path="${1%.sh}.ps1" user="${SSH_VPS_USER:-root}"
+    local name="${path##*/}"
+    if [[ "$user" == root ]]; then
+        printf '%s' "scp root@${VPS_IP}:$path . ; powershell -ExecutionPolicy Bypass -File .\\$name"
+    else
+        printf '%s' "ssh ${user}@${VPS_IP} 'sudo cat $path' > $name ; powershell -ExecutionPolicy Bypass -File .\\$name"
     fi
 }
 
@@ -1042,6 +1461,7 @@ _load_phone_state() {
     SSH_VPS_USER="$(json_get "$state" ssh_vps_user)"; SSH_VPS_USER="${SSH_VPS_USER:-$(id -un)}"
     SSH_HOST_PUBKEY="$(json_get "$state" ssh_host_pubkey)"
     SSH_HOST_FINGERPRINT="$(json_get "$state" ssh_host_fingerprint)"
+    load_tls_state
     # The alias chosen at install time names the per-client aliases too
     # (ALIAS-LABEL). An explicit --alias still wins.
     if [[ -z "$SSH_ALIAS" ]]; then
@@ -1110,6 +1530,8 @@ add_client() {
     echo "  Client script for '${CLIENT_LABEL}': $f"
     echo "  To connect from that device:"
     echo "    $(fetch_hint "$f")"
+    echo "  From Windows (PowerShell):"
+    echo "    $(fetch_hint_windows "$f")"
     echo ""
 }
 
@@ -1141,7 +1563,7 @@ revoke_client() {
     fi
 
     _revoke_vps_jump_key "$pub" "$PHONE_WG_IP" "$SSH_PHONE_PORT"
-    rm -f "$ck" "$ck.pub" "$SSH_KEY_DIR/client-setup-${CLIENT_LABEL}-${DEVICE_NAME}.sh"
+    rm -f "$ck" "$ck.pub" "$SSH_KEY_DIR/client-setup-${CLIENT_LABEL}-${DEVICE_NAME}".{sh,ps1}
     info "Local files for client '${CLIENT_LABEL}' removed"
 }
 
@@ -1202,6 +1624,7 @@ generate_back_handoff() {
         --argjson wg_port      "$WG_PORT" \
         --argjson wstunnel_port "$WSTUNNEL_PORT" \
         --arg  ssh_alias       "$SSH_ALIAS" \
+        --arg  vps_domain      "$VPS_DOMAIN" \
         '{
             version:        $version,
             device_name:    $device_name,
@@ -1213,7 +1636,7 @@ generate_back_handoff() {
             wg_port:        $wg_port,
             wstunnel_port:  $wstunnel_port,
             ssh_alias:      $ssh_alias
-        }')" || die "jq: could not assemble the base back-handoff"
+        } + (if $vps_domain == "" then {} else {vps_domain: $vps_domain} end)')" || die "jq: could not assemble the base back-handoff"
 
     # SSH fields (conditional)
     if [[ "$SSH_ENABLED" == "1" ]]; then
@@ -1236,7 +1659,7 @@ generate_back_handoff() {
             --arg     ssh_user              "$SSH_USER" \
             --argjson ssh_port              "$SSH_PHONE_PORT" \
             --arg     ssh_phone_ip          "$PHONE_WG_IP" \
-            --arg     ssh_vps_host          "$VPS_IP" \
+            --arg     ssh_vps_host          "$(vps_public_host)" \
             --arg     ssh_vps_user          "$SSH_VPS_USER" \
             --arg     ssh_vps_to_phone_pubkey "$SSH_VPS_TO_PHONE_PUBKEY" \
             --arg     ssh_host_fingerprint  "${SSH_HOST_FINGERPRINT:-}" \
@@ -1488,7 +1911,7 @@ remove_device() {
         [[ -n "$phone_ip" && -n "$port" ]] && _revoke_vps_jump_key "$(cat "$f")" "$phone_ip" "$port"
         rm -f "${f%.pub}" "$f"
     done < <( { [[ -f "$SSH_KEY_DIR/owner_${name}.pub" ]] && echo "$SSH_KEY_DIR/owner_${name}.pub"; device_client_pubs "$name"; } )
-    rm -f "$SSH_KEY_DIR/client-setup-owner-${name}.sh" "$SSH_KEY_DIR"/client-setup-*-"${name}".sh
+    rm -f "$SSH_KEY_DIR/client-setup-owner-${name}".{sh,ps1} "$SSH_KEY_DIR"/client-setup-*-"${name}".{sh,ps1}
     rm -f "$record"
     info "Phone '$name' removed from this VPS."
     [[ -n "$(device_names)" ]] || info "No phones left; the VPS services stay installed (use --uninstall to remove everything)."
@@ -1544,6 +1967,13 @@ uninstall_vps() {
         warn "wstunnel was not installed by us — not removing the binary"
     fi
     _remove_all_vps_jump_entries
+    if [[ -f "$TLS_STATE" ]]; then
+        local domain
+        domain="$(json_get "$TLS_STATE" domain)"
+        [[ "$(json_get "$TLS_STATE" source)" != letsencrypt ]] \
+            || info "The Let's Encrypt certificate for $domain stays; remove it with: certbot delete --cert-name $domain"
+    fi
+    rm -f "$LETSENCRYPT_DIR/renewal-hooks/deploy/serverinator-wstunnel.sh"
     rm -rf "$WG_KEY_DIR"
     [[ "$DEV" != 1 ]] && systemctl daemon-reload
     # The orchestrator keeps these scripts in /root/.serverinator/bin. Bash
@@ -1560,8 +1990,8 @@ uninstall_vps() {
 
 # Warns when a host firewall would drop the tunnel port (review #17). It
 # never changes firewall rules: the admin decides.
-check_firewall() {
-    local port="$WSTUNNEL_PORT" hint=""
+check_firewall() { # [PORT [PURPOSE]]
+    local port="${1:-$WSTUNNEL_PORT}" purpose="${2:-the tunnel needs}" hint=""
     if have_cmd ufw && ufw status 2>/dev/null | head -1 | grep -q '^Status: active'; then
         ufw status 2>/dev/null | grep -qE "^${port}(/tcp)?[[:space:]].*ALLOW" \
             || hint="ufw allow ${port}/tcp"
@@ -1573,7 +2003,7 @@ check_firewall() {
             || hint="iptables -I INPUT -p tcp --dport ${port} -j ACCEPT (and save it)"
     fi
     if [[ -n "$hint" ]]; then
-        warn "A firewall on this VPS seems to block TCP port ${port}, which the tunnel needs."
+        warn "A firewall on this VPS seems to block TCP port ${port}, which ${purpose}."
         warn "  Open it with:  $hint"
         warn "  (Also check your provider's firewall or security group.)"
     fi
@@ -1627,6 +2057,7 @@ main() {
         add-client)     add_client;     return ;;
         revoke-client)  revoke_client;  return ;;
         list-clients)   list_clients;   return ;;
+        set-domain)     set_domain;     return ;;
     esac
 
     # MODE=setup
@@ -1646,6 +2077,7 @@ main() {
     setup_wireguard
 
     step 4/6 "Setting up wstunnel"
+    setup_tls
     setup_wstunnel_server
     fix_pmtu_clamp
     [[ "$DEV" == 1 ]] || check_firewall
@@ -1662,6 +2094,8 @@ main() {
         echo ""
         echo "  To connect from any device:"
         echo "    $(fetch_hint "$OWNER_CLIENT_SETUP_PATH")"
+        echo "  From Windows (PowerShell):"
+        echo "    $(fetch_hint_windows "$OWNER_CLIENT_SETUP_PATH")"
         echo ""
     fi
 }

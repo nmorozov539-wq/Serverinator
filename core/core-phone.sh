@@ -61,6 +61,14 @@ else
     SSH_HOSTKEY_DIR="${SERVERINATOR_SSH_HOSTKEY_DIR:-/data/adb/serverinator/ssh}"
 fi
 
+# Identity kept outside the chroot so a chroot rebuild, an uninstall without
+# --purge, or a move to another phone (--export/--import-identity) keeps the
+# WireGuard key the VPS knows. SSH host keys live in SSH_HOSTKEY_DIR.
+IDENTITY_DIR="${SERVERINATOR_IDENTITY_DIR:-$STATE_DIR/identity}"
+# serverinator.sh's key for logging into the VPS (same default as there).
+ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-/data/adb/serverinator/orchestrator}"
+IDENTITY_FILE=""
+
 # ── Shared library ────────────────────────────
 # Resolved once at the top level: inside a function, the phone's bash gave
 # BASH_SOURCE without its directory (hardware run 2026-10-14).
@@ -83,6 +91,12 @@ parse_args() {
                 BACK_HANDOFF_FILE="$1"; shift
                 ;;
             --uninstall) MODE="uninstall"; shift ;;
+            --export-identity|--import-identity)
+                [[ "$1" == --export-identity ]] && MODE="export-identity" || MODE="import-identity"
+                shift
+                [[ $# -gt 0 ]] || die "${MODE/-identity/} needs a FILE"
+                IDENTITY_FILE="$1"; shift
+                ;;
             --purge)     PURGE=1; shift ;;
             --no-ssh)    ENABLE_SSH=0; shift ;;
             --chroot-tmp)
@@ -493,7 +507,35 @@ STUB
     info "wstunnel installed to $dest"
 )
 
+# The chroot's copy is what WireGuard uses; IDENTITY_DIR keeps a copy that
+# survives a chroot rebuild and restores it before a new key would be made.
 generate_wg_keys() {
+    restore_wg_identity
+    _generate_wg_keys
+    persist_wg_identity
+}
+
+restore_wg_identity() {
+    local key_dir="$CHROOT/etc/wireguard"
+    [[ -s "$key_dir/client.key" && -s "$key_dir/client.pub" ]] && return 0
+    [[ -s "$IDENTITY_DIR/wireguard/client.key" && -s "$IDENTITY_DIR/wireguard/client.pub" ]] || return 0
+    mkdir -p "$key_dir"; chmod 700 "$key_dir"
+    (umask 077; cp -f "$IDENTITY_DIR/wireguard/client.key" "$IDENTITY_DIR/wireguard/client.pub" "$key_dir/")
+    info "Restored the saved WireGuard key ($(cat "$key_dir/client.pub"))"
+}
+
+persist_wg_identity() {
+    local key_dir="$CHROOT/etc/wireguard" store="$IDENTITY_DIR/wireguard"
+    [[ -s "$key_dir/client.key" && -s "$key_dir/client.pub" ]] || return 0
+    if [[ -f "$store/client.key" ]] && cmp -s "$key_dir/client.key" "$store/client.key"; then
+        return 0
+    fi
+    [[ -f "$store/client.key" ]] && warn "Saved WireGuard key differed from the one in use; saving the one in use"
+    mkdir -p "$store"; chmod 700 "$IDENTITY_DIR" "$store"
+    (umask 077; cp -f "$key_dir/client.key" "$key_dir/client.pub" "$store/")
+}
+
+_generate_wg_keys() {
     local key_dir="$CHROOT/etc/wireguard"
     local priv_key="$key_dir/client.key"
     local pub_key="$key_dir/client.pub"
@@ -757,16 +799,30 @@ EOF
     info "sshd autostart written: $script_path"
 }
 
-# write_wstunnel_autostart VPS_IP
-# Called only from apply_back_handoff — once the VPS IP is known.
+# write_wstunnel_autostart VPS_IP [DOMAIN]
+# Called only from apply_back_handoff — once the VPS IP is known. With a
+# DOMAIN the tunnel connects by name, so the VPS's real certificate matches;
+# SERVERINATOR_TLS_VERIFY=1 also makes wstunnel check that certificate.
 # Values are substituted directly; no placeholders, no sed.
 write_wstunnel_autostart() {
-    local vps_ip="$1"
+    local vps_ip="$1" domain="${2:-}"
     [[ -n "$vps_ip" ]] || die "write_wstunnel_autostart: VPS IP not provided"
     validate_host "$vps_ip"
+    [[ -z "$domain" ]] || validate_domain "$domain"
+    local endpoint="${domain:-$vps_ip}" verify_line=""
+    if [[ "${SERVERINATOR_TLS_VERIFY:-0}" == 1 ]]; then
+        [[ -n "$domain" ]] || die "SERVERINATOR_TLS_VERIFY=1 needs a domain with a real certificate"
+        verify_line="        --tls-verify-certificate \\
+"
+    fi
     validate_tunnel_port "$WG_LOCAL_PORT"
     validate_tunnel_port "$WG_VPS_PORT"
     validate_tunnel_port "$WSTUNNEL_PORT"
+
+    # Readiness probe: a route to the VPS itself. A hostname can't be routed
+    # before DNS works, so probe a public address instead.
+    local probe_ip="$vps_ip"
+    [[ "$vps_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || probe_ip="1.1.1.1"
 
     local script_path="$MAGISK_SERVICE_D/10-serverinator-wstunnel.sh"
     mkdir -p "$MAGISK_SERVICE_D"
@@ -800,10 +856,16 @@ cleanup() {
     rm -f "\$STATE_DIR/run/wstunnel.pid" "\$STATE_DIR/run/wstunnel-supervisor.pid"
 }
 trap 'cleanup; exit' INT TERM
-# Wait for a default route to appear (network is up), up to 120s.
+# Wait until the VPS is routable (network is up), up to 120s. Android keeps
+# its default route in per-network tables, not main, so "ip route show
+# default" stays empty and used to burn the full 120s on every boot.
 i=0
 while [ "\$i" -lt 60 ]; do
-    ip route show default 2>/dev/null | grep -q 'default' && break
+    route=\$(ip route get ${probe_ip} 2>/dev/null) || route=''
+    case "\$route" in
+        ''|*' dev lo'*|*' dev dummy'*|*unreachable*|*prohibit*) ;;
+        *) break ;;
+    esac
     sleep 2; i=\$((i+1))
 done
 while true; do
@@ -812,8 +874,8 @@ while true; do
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\
         HOME=/root TMPDIR=/tmp /usr/local/bin/wstunnel client \\
         --log-lvl INFO \\
-        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VPS_PORT}?timeout_sec=0" \\
-        wss://${vps_ip}:${WSTUNNEL_PORT} \\
+${verify_line}        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VPS_PORT}?timeout_sec=0" \\
+        wss://${endpoint}:${WSTUNNEL_PORT} \\
         >> "\$LOG" 2>&1 &
     child=\$!
     printf '%s\\n' "\$child" > "\$STATE_DIR/run/wstunnel.pid"
@@ -861,6 +923,8 @@ generate_handoff() {
         || die "Device name not set. Pass --device-name NAME or set SERVERINATOR_DEVICE_NAME."
     validate_device_name "$DEVICE_NAME"
     validate_wg_key "$pub_key"
+    mkdir -p "$IDENTITY_DIR"; chmod 700 "$IDENTITY_DIR"
+    printf '%s\n' "$DEVICE_NAME" > "$IDENTITY_DIR/device-name"
 
     local ssh_enabled=0
     [[ "$ENABLE_SSH" == "1" ]] && ssh_enabled=1
@@ -910,8 +974,9 @@ apply_back_handoff() {
     version="$(json_get_num "$BACK_HANDOFF_FILE" version)"
     [[ "$version" == "1" ]] || die "Unsupported back-handoff version: $version"
 
-    local vps_ip vps_wg_pubkey phone_wg_ip vps_wg_ip wg_port wstunnel_port
+    local vps_ip vps_domain vps_wg_pubkey phone_wg_ip vps_wg_ip wg_port wstunnel_port
     vps_ip="$(json_get "$BACK_HANDOFF_FILE" vps_ip)"
+    vps_domain="$(json_get "$BACK_HANDOFF_FILE" vps_domain)"
     vps_wg_pubkey="$(json_get "$BACK_HANDOFF_FILE" vps_wg_pubkey)"
     phone_wg_ip="$(json_get "$BACK_HANDOFF_FILE" phone_wg_ip)"
     vps_wg_ip="$(json_get "$BACK_HANDOFF_FILE" vps_wg_ip)"
@@ -927,6 +992,7 @@ apply_back_handoff() {
     phone_key="$(json_get "$BACK_HANDOFF_FILE" phone_wg_pubkey)"
     validate_device_name "$handoff_device"
     validate_host "$vps_ip"
+    [[ -z "$vps_domain" ]] || validate_domain "$vps_domain"
     validate_wg_key "$vps_wg_pubkey"
     validate_wg_key "$phone_key"
     validate_optional_ports "$BACK_HANDOFF_FILE"
@@ -979,7 +1045,7 @@ EOF
     info "WireGuard client config written to $wg_conf"
 
     # ── Write the wstunnel autostart with the real VPS IP ──
-    write_wstunnel_autostart "$vps_ip"
+    write_wstunnel_autostart "$vps_ip" "$vps_domain"
 
     # ── Write WireGuard autostart script ──────
     local wg_script="$MAGISK_SERVICE_D/20-serverinator-wireguard.sh"
@@ -1053,6 +1119,7 @@ EOF
     info "  Phone WG IP : $phone_wg_ip"
     info "  VPS WG IP   : $vps_wg_ip"
     info "  VPS IP      : $vps_ip"
+    [[ -z "$vps_domain" ]] || info "  VPS domain  : $vps_domain (tunnel connects by name)"
     info "Reboot the phone — services will come up automatically via Magisk."
 }
 
@@ -1145,6 +1212,10 @@ apply_ssh_config() {
         managed+=("$key")
     done
     write_managed_authorized_keys "$ak" ${managed[@]+"${managed[@]}"}
+    if [[ -f "$IDENTITY_DIR/pending-extra-keys" ]]; then
+        merge_extra_keys "$ak" "$IDENTITY_DIR/pending-extra-keys"
+        rm -f "$IDENTITY_DIR/pending-extra-keys"
+    fi
 
     prepare_sshd_runtime "$phone_wg_ip"
     write_sshd_autostart
@@ -1270,6 +1341,7 @@ uninstall_phone() {
     check_root
     safe_remove_path "$CHROOT"
     safe_remove_path "$SSH_HOSTKEY_DIR"
+    safe_remove_path "$IDENTITY_DIR"
     local name file pid proc script
     if [[ "$DEV" != 1 ]]; then
         # Stop only supervisors named by exact script argv and children in this root.
@@ -1328,11 +1400,223 @@ uninstall_phone() {
         rm -f "$MAGISK_SERVICE_D/$name.sh" "$MAGISK_SERVICE_D/$name.sh.bak"
     done
     rm -rf "$CHROOT"
-    if [[ "$PURGE" == 1 ]]; then rm -rf "$SSH_HOSTKEY_DIR"; fi
+    if [[ "$PURGE" == 1 ]]; then rm -rf "$SSH_HOSTKEY_DIR" "$IDENTITY_DIR"; fi
     # Logs and .bak backups are pure operational debris, not identity state —
     # always clear them, regardless of --purge.
     rm -rf "$STATE_DIR/run" "$STATE_DIR/logs" "$STATE_DIR/backups"
-    info "Phone uninstall complete; host keys preserved unless --purge"
+    info "Phone uninstall complete; WireGuard and SSH host keys kept unless --purge"
+}
+
+# ── Identity backup / restore ─────────────────
+#
+# --export-identity FILE writes a tar with everything that makes this phone
+# "the same phone" to the VPS and to clients:
+#   wireguard/client.key, client.pub   the tunnel key the VPS has as a peer
+#   ssh/ssh_host_*_key[.pub]           the host key clients have pinned
+#   orchestrator/id_ed25519[.pub]      serverinator.sh's key for the VPS
+#   extra-keys                         authorized_keys lines outside the
+#                                      managed block (--add-client keys and
+#                                      hand-added keys)
+#   manifest                           format, device name, public key
+# --import-identity FILE puts those back on a new or reset phone, before
+# serverinator.sh is run with the same device name and VPS. The VPS then
+# sees the same peer and nothing on it or on clients has to change.
+
+IDENTITY_TOP="serverinator-identity"
+
+# Prints authorized_keys lines that live outside the managed block and are
+# plain public keys (no options), one per line.
+extra_authorized_keys() {
+    local ak="$1" line in_block=0
+    [[ -f "$ak" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$AK_BEGIN" ]]; then in_block=1; continue; fi
+        if [[ "$line" == "$AK_END" ]]; then in_block=0; continue; fi
+        ((in_block)) && continue
+        [[ "$line" =~ [[:space:]](serverinator-vps-|serverinator:owner:)[^[:space:]]*$ ]] && continue
+        is_plain_pubkey "$line" && printf '%s\n' "$line"
+    done < "$ak"
+    return 0
+}
+
+# merge_extra_keys AUTHORIZED_KEYS KEYS_FILE: appends lines not already there.
+merge_extra_keys() {
+    local ak="$1" keys="$2" line added=0
+    mkdir -p "$(dirname "$ak")"; chmod 700 "$(dirname "$ak")"
+    touch "$ak"; chmod 600 "$ak"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] || continue
+        grep -qFx -- "$line" "$ak" && continue
+        printf '%s\n' "$line" >> "$ak"; added=$((added + 1))
+    done < "$keys"
+    ((added == 0)) || info "Restored $added extra SSH key(s) (clients, hand-added keys)"
+}
+
+export_identity() {
+    local out="$1" wg_dir name stage f n=0
+    check_root
+    [[ -n "$out" ]] || die "--export-identity needs a FILE"
+    [[ ! -e "$out" ]] || die "$out already exists; choose a new file name"
+
+    if [[ -s "$CHROOT/etc/wireguard/client.key" ]]; then
+        wg_dir="$CHROOT/etc/wireguard"
+    elif [[ -s "$IDENTITY_DIR/wireguard/client.key" ]]; then
+        wg_dir="$IDENTITY_DIR/wireguard"
+    else
+        die "No WireGuard key on this phone; nothing to export (install first)"
+    fi
+    validate_wg_key "$(cat "$wg_dir/client.pub")"
+
+    name="${DEVICE_NAME:-}"
+    [[ -n "$name" || ! -s "$IDENTITY_DIR/device-name" ]] || name="$(cat "$IDENTITY_DIR/device-name")"
+    [[ -z "$name" ]] || validate_device_name "$name"
+
+    stage="$(mktemp -d)" || die "Could not create a temp directory"
+    (
+        umask 077
+        set -e
+        mkdir -p "$stage/$IDENTITY_TOP/wireguard"
+        cp "$wg_dir/client.key" "$wg_dir/client.pub" "$stage/$IDENTITY_TOP/wireguard/"
+        for f in "$SSH_HOSTKEY_DIR"/ssh_host_*_key; do
+            [[ -f "$f" && -f "$f.pub" ]] || continue
+            mkdir -p "$stage/$IDENTITY_TOP/ssh"
+            cp "$f" "$f.pub" "$stage/$IDENTITY_TOP/ssh/"
+        done
+        if [[ -f "$ORCHESTRATOR_SSH_DIR/id_ed25519" && -f "$ORCHESTRATOR_SSH_DIR/id_ed25519.pub" ]]; then
+            mkdir -p "$stage/$IDENTITY_TOP/orchestrator"
+            cp "$ORCHESTRATOR_SSH_DIR/id_ed25519" "$ORCHESTRATOR_SSH_DIR/id_ed25519.pub" "$stage/$IDENTITY_TOP/orchestrator/"
+        fi
+        extra_authorized_keys "$CHROOT/root/.ssh/authorized_keys" > "$stage/$IDENTITY_TOP/extra-keys"
+        {
+            echo "format=1"
+            echo "device_name=$name"
+            echo "wg_pubkey=$(cat "$wg_dir/client.pub")"
+            echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > "$stage/$IDENTITY_TOP/manifest"
+        tar -cf "$out" -C "$stage" "$IDENTITY_TOP"
+        chmod 600 "$out"
+    ) || { rm -rf "$stage"; rm -f "$out"; die "Could not write $out"; }
+    rm -rf "$stage"
+
+    [[ -d "$SSH_HOSTKEY_DIR" ]] && n="$(find "$SSH_HOSTKEY_DIR" -maxdepth 1 -name 'ssh_host_*_key' | wc -l)"
+    ok "Identity saved to $out"
+    info "  Device name : ${name:-(unknown; use the same name as before when reinstalling)}"
+    info "  WireGuard   : $(cat "$wg_dir/client.pub")"
+    info "  SSH host keys: ${n// /}"
+    warn "This file holds private keys. Keep it somewhere safe and off the phone."
+}
+
+# Every path a format-1 identity tar may contain.
+identity_path_ok() {
+    [[ "$1" =~ ^serverinator-identity(/(manifest|extra-keys|wireguard/client\.(key|pub)|ssh/ssh_host_[a-z0-9]+_key(\.pub)?|orchestrator/id_ed25519(\.pub)?|wireguard|ssh|orchestrator))?/?$ ]]
+}
+
+import_identity() {
+    local in="$1" stage top line name f base key
+    check_root
+    [[ -f "$in" ]] || die "No such file: $in"
+
+    # Only regular files and directories under the expected names.
+    local listing
+    listing="$(tar -tvf "$in" 2>/dev/null)" || die "$in is not a readable tar file"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        [[ "$line" == -* || "$line" == d* ]] || die "$in contains something that isn't a plain file: $line"
+    done <<< "$listing"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        identity_path_ok "$line" || die "$in has an unexpected entry: $line"
+    done < <(tar -tf "$in")
+
+    stage="$(mktemp -d)" || die "Could not create a temp directory"
+    (umask 077; tar -xf "$in" -C "$stage") || { rm -rf "$stage"; die "Could not unpack $in"; }
+    top="$stage/$IDENTITY_TOP"
+
+    # Validate everything before changing anything.
+    grep -qx 'format=1' "$top/manifest" 2>/dev/null \
+        || { rm -rf "$stage"; die "$in is not a ServerInator identity (format 1)"; }
+    name="$(sed -n 's/^device_name=//p' "$top/manifest")"
+    [[ -z "$name" ]] || (validate_device_name "$name") > /dev/null 2>&1 \
+        || { rm -rf "$stage"; die "$in has an invalid device name"; }
+    [[ -s "$top/wireguard/client.key" && -s "$top/wireguard/client.pub" ]] \
+        || { rm -rf "$stage"; die "$in has no WireGuard key"; }
+    (validate_wg_key "$(cat "$top/wireguard/client.key")" && validate_wg_key "$(cat "$top/wireguard/client.pub")") \
+        > /dev/null 2>&1 || { rm -rf "$stage"; die "$in has an invalid WireGuard key"; }
+    for f in "$top"/ssh/ssh_host_*_key "$top"/orchestrator/id_ed25519; do
+        [[ -e "$f" ]] || continue
+        head -n 1 "$f" | grep -q -- '-----BEGIN .*PRIVATE KEY-----' \
+            || { rm -rf "$stage"; die "${f#"$top/"} is not a private key"; }
+        [[ -f "$f.pub" ]] && is_plain_pubkey "$(cat "$f.pub")" \
+            || { rm -rf "$stage"; die "${f#"$top/"}.pub is missing or not a public key"; }
+    done
+    if [[ -f "$top/extra-keys" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] || is_plain_pubkey "$line" \
+                || { rm -rf "$stage"; die "extra-keys has a line that isn't a public key"; }
+        done < "$top/extra-keys"
+    fi
+
+    # Refuse to replace a different identity that is already installed.
+    for key in "$CHROOT/etc/wireguard/client.key" "$IDENTITY_DIR/wireguard/client.key"; do
+        if [[ -s "$key" ]] && ! cmp -s "$key" "$top/wireguard/client.key"; then
+            rm -rf "$stage"
+            die "This phone already has a different WireGuard key ($key). Run 'core-phone.sh --uninstall --purge' first if you really want to replace it."
+        fi
+    done
+    for f in "$top"/ssh/ssh_host_*_key; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        if [[ -s "$SSH_HOSTKEY_DIR/$base" ]] && ! cmp -s "$SSH_HOSTKEY_DIR/$base" "$f"; then
+            rm -rf "$stage"
+            die "This phone already has a different SSH host key ($SSH_HOSTKEY_DIR/$base). Run 'core-phone.sh --uninstall --purge' first if you really want to replace it."
+        fi
+    done
+
+    (
+        umask 077
+        set -e
+        mkdir -p "$IDENTITY_DIR/wireguard"
+        cp -f "$top/wireguard/client.key" "$top/wireguard/client.pub" "$IDENTITY_DIR/wireguard/"
+        [[ -z "$name" ]] || printf '%s\n' "$name" > "$IDENTITY_DIR/device-name"
+        if [[ -d "$CHROOT/etc/wireguard" ]]; then
+            cp -f "$top/wireguard/client.key" "$top/wireguard/client.pub" "$CHROOT/etc/wireguard/"
+        fi
+        for f in "$top"/ssh/ssh_host_*_key; do
+            [[ -e "$f" ]] || continue
+            mkdir -p "$SSH_HOSTKEY_DIR"
+            cp -f "$f" "$f.pub" "$SSH_HOSTKEY_DIR/"
+            if [[ -d "$CHROOT/etc/ssh" ]]; then cp -f "$f" "$f.pub" "$CHROOT/etc/ssh/"; fi
+        done
+        if [[ -f "$top/orchestrator/id_ed25519" ]]; then
+            mkdir -p "$ORCHESTRATOR_SSH_DIR"
+            if [[ -f "$ORCHESTRATOR_SSH_DIR/id_ed25519" ]] \
+                && ! cmp -s "$ORCHESTRATOR_SSH_DIR/id_ed25519" "$top/orchestrator/id_ed25519"; then
+                mv -f "$ORCHESTRATOR_SSH_DIR/id_ed25519" "$ORCHESTRATOR_SSH_DIR/id_ed25519.before-import"
+                mv -f "$ORCHESTRATOR_SSH_DIR/id_ed25519.pub" "$ORCHESTRATOR_SSH_DIR/id_ed25519.pub.before-import" 2>/dev/null || true
+                echo "orchestrator-replaced" > "$stage/notes"
+            fi
+            cp -f "$top/orchestrator/id_ed25519" "$top/orchestrator/id_ed25519.pub" "$ORCHESTRATOR_SSH_DIR/"
+        fi
+    ) || { rm -rf "$stage"; die "Could not put the identity in place"; }
+    chmod 700 "$IDENTITY_DIR" "$IDENTITY_DIR/wireguard" 2>/dev/null || true
+    [[ -d "$SSH_HOSTKEY_DIR" ]] && chmod 700 "$SSH_HOSTKEY_DIR"
+    [[ -f "$stage/notes" ]] && warn "Replaced this phone's own VPS login key; the old one is kept as id_ed25519.before-import"
+
+    if [[ -s "$top/extra-keys" ]]; then
+        if [[ -d "$CHROOT/root" ]]; then
+            merge_extra_keys "$CHROOT/root/.ssh/authorized_keys" "$top/extra-keys"
+        else
+            (umask 077; mkdir -p "$IDENTITY_DIR"; cp -f "$top/extra-keys" "$IDENTITY_DIR/pending-extra-keys")
+            info "Extra SSH keys will be added when the install finishes"
+        fi
+    fi
+    rm -rf "$stage"
+
+    ok "Identity imported"
+    info "  WireGuard: $(cat "$IDENTITY_DIR/wireguard/client.pub")"
+    echo ""
+    echo "  Next: run serverinator.sh with the same VPS${name:+ and device name '$name'}."
+    echo "  The VPS will see the same phone, so clients keep working unchanged."
 }
 
 # ── Main ──────────────────────────────────────
@@ -1340,6 +1624,8 @@ uninstall_phone() {
 main() {
     parse_args "$@"
     if [[ "$MODE" == uninstall ]]; then uninstall_phone; return; fi
+    if [[ "$MODE" == export-identity ]]; then export_identity "$IDENTITY_FILE"; return; fi
+    if [[ "$MODE" == import-identity ]]; then import_identity "$IDENTITY_FILE"; return; fi
     [[ "$PURGE" == 0 ]] || die "--purge requires --uninstall"
 
     if [[ "$MODE" == "apply-back-handoff" ]]; then

@@ -61,8 +61,8 @@ sshd inside a Linux chroot on the phone
    inside Termux) and get a root shell there.
 
 2. **Run the installer** and answer its questions (VPS address,
-   a name for this device, an SSH alias, and whether the chroot's `/tmp`
-   lives in RAM or on disk):
+   a name for this device, an SSH alias, whether the chroot's `/tmp`
+   lives in RAM or on disk, and optionally a domain for the VPS):
 
    ```
    bash serverinator.sh
@@ -144,6 +144,49 @@ ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --add-client LABEL --devi
 ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --remove-device NAME'
 ```
 
+**Use a domain and a real certificate.** If a domain or subdomain points
+at the VPS (a DNS A record), give it to the installer, either at the
+survey question or as `--domain vps.example.com [--acme-email you@example.com]`.
+The VPS gets a Let's Encrypt certificate for the tunnel and renews it on
+its own, phones connect by name, and client scripts jump through the
+domain. Let's Encrypt checks the domain over port 80. If a web server
+running as a systemd service (Caddy, nginx, ...) already uses that port,
+it is stopped for the few seconds of each check and started again. To use
+a certificate you already have, run on the VPS:
+`core-vps.sh --set-domain D --tls-cert /abs/fullchain.pem --tls-key /abs/privkey.pem`.
+
+An existing install by IP moves over without reinstalling. Run this on
+the phone:
+
+```
+bash serverinator.sh --vps root@VPS --set-domain vps.example.com
+```
+
+Other phones on the same VPS keep working by IP until you run the same
+command on each of them. `--remove-domain` goes back to the self-signed
+certificate.
+
+**Connect from Windows.** Every client setup script has a PowerShell twin
+next to it (`client-setup-*.ps1`) for the OpenSSH client built into
+Windows:
+
+```
+scp your-vps:/etc/wireguard/serverinator/ssh/client-setup-owner-DEVICE.ps1 .
+powershell -ExecutionPolicy Bypass -File .\client-setup-owner-DEVICE.ps1
+```
+
+**Move to a new phone.** Export the old phone's identity (its WireGuard
+and SSH host keys, the VPS login key and extra authorized keys), import it
+on the new phone, then run the installer with the same VPS and device
+name. The VPS and every client keep working unchanged.
+
+```
+bash core/core-phone.sh --export-identity /sdcard/si-identity.tar   # old phone
+bash core/core-phone.sh --import-identity /sdcard/si-identity.tar   # new phone
+```
+
+The file holds private keys, so treat it like a password.
+
 **Uninstall.** On the phone (removes the chroot and autostart scripts;
 `--purge` also deletes the persisted SSH host key, giving you a fully
 fresh identity on the next install):
@@ -178,6 +221,10 @@ ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --uninstall'
 - The phone's SSH host key travels with the install and is pinned on the
   VPS and in every generated client script, so a client that reaches the
   wrong machine refuses to connect instead of asking you to trust it.
+- With a domain, the tunnel serves a real certificate. The phone doesn't
+  verify it by default, since WireGuard already authenticates both ends
+  and a wrong certificate can't take over the tunnel. Set
+  `SERVERINATOR_TLS_VERIFY=1` when installing to make it verify anyway.
 - The Ubuntu base image and the `wstunnel` binary are checked against
   pinned SHA-256 hashes before use, and an interrupted rootfs extraction
   is detected and redone rather than half-used.
@@ -190,11 +237,13 @@ bash tests/run_tests.sh
 
 Runs the full local regression suite — no real phone or VPS required.
 Everything is exercised against mocked chroots, systemd units, and SSH
-calls. 29 test files, covering install/uninstall, address allocation,
+calls. 33 test files, covering install/uninstall, address allocation,
 handoff validation, the generated Magisk scripts' actual shell syntax,
 the client add/revoke/list flow including the VPS-side access
-restriction above, VPS authorization, several phones per VPS, and host
-key pinning.
+restriction above, VPS authorization, several phones per VPS, host key
+pinning, domains and certificates (with a fake certbot), identity
+export/import, and the Windows client script (run under PowerShell when
+`pwsh` is installed).
 
 ## Known limitations and roadmap
 
@@ -204,14 +253,6 @@ a private backlog.
 
 ### Works today, but with a sharp edge
 
-- **Windows client setup needs WSL or Git Bash.** The generated
-  `client-setup-*.sh` script is bash. It runs natively on Linux and
-  Termux; on Windows there's no native `.ps1` equivalent yet, so you need
-  one of those two compatibility layers in the meantime.
-- **The tunnel can take a couple of minutes to come up after a reboot.**
-  The autostart scripts wait for the phone's network before starting, and
-  on some boots that wait runs long. It does come up on its own; if
-  `ssh` says "No route to host" right after a reboot, give it a minute.
 - **Everything is root-only.** There's no concept yet of a lower-privilege
   user inside the chroot, or of giving a client limited access instead of
   full root. Every added client gets the same level of access the owner
@@ -223,22 +264,13 @@ a private backlog.
   VPS died, or the tunnel dropped, is to try to connect and notice it
   failing. A lightweight watchdog pushing a notification on a missed
   handshake would close this gap.
-- **No identity backup/restore.** If the phone is lost, factory reset, or
-  replaced, its WireGuard key and persisted SSH host key go with it, and
-  the VPS side needs to be reconfigured too. There's no single command to
-  export "this installation's identity" and restore it onto a new device.
 - **No dedicated VPS-migration workflow**, even though the pieces mostly
   exist: the phone's keys and chroot don't depend on which VPS they're
   talking to, so re-running the installer pointed at a different VPS
   address *should* just work. That path has not been deliberately tested
   end-to-end as a "my VPS died, now what" story, so it's not something to
-  rely on yet without trying it first.
-- **No optional custom domain / real TLS certificate.** The VPS currently
-  presents a self-signed certificate on its WSS endpoint, and everything
-  addresses the VPS by raw IP. Supporting a real domain (and certificate)
-  at install time would make VPS migration a DNS change instead of a
-  phone-side reconfiguration, and might make the traffic blend in better
-  on networks that specifically distrust self-signed TLS.
+  rely on yet without trying it first. With a domain, the phones already
+  connect by name, so a migration could become mostly a DNS change.
 - **Startup ordering inside the Magisk scripts is poll-based, not
   event-driven.** Each of the autostart scripts waits on a
   dependency by checking every couple of seconds, up to a timeout, then

@@ -220,6 +220,23 @@ validate_ipv4() {
     done
 }
 
+# A DNS name for a certificate: a hostname with at least one dot, not an IP,
+# lower-cased by the caller. Wildcards aren't accepted.
+# An e-mail address for Let's Encrypt notices. Restricted to characters
+# that are safe in a remote shell command line.
+validate_email() {
+    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] \
+        || die "Invalid e-mail address: '$1'"
+}
+
+validate_domain() {
+    local d="$1"
+    [[ -n "$d" && "$d" == *.* && ! "$d" =~ ^[0-9.]+$ && "$d" =~ ^[a-z0-9.-]+$ ]] \
+        || die "Invalid domain: '${d}' (expected something like vps.example.com)"
+    [[ "${d##*.}" =~ [a-z] ]] || die "Invalid domain: '${d}' (the last part must contain a letter)"
+    validate_host "$d"
+}
+
 validate_host() {
     local host="$1"
     if [[ "$host" =~ ^[0-9.]+$ ]]; then
