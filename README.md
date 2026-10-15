@@ -175,6 +175,30 @@ scp your-vps:/etc/wireguard/serverinator/ssh/client-setup-owner-DEVICE.ps1 .
 powershell -ExecutionPolicy Bypass -File .\client-setup-owner-DEVICE.ps1
 ```
 
+**Share folders with a guest.** A guest gets files only: no shell, and
+only the folders you choose, each read-only or read-write. They connect
+with FileZilla, WinSCP or an Android SFTP app to the VPS's normal SSH port
+as `serverinator-files`, using a key file. The VPS hops on to the phone
+for them, so no new port is opened.
+
+```
+ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --add-guest anna'
+```
+
+Without `--folder` it asks for the folders one by one. You can also pass
+them: `--folder photos` means `/srv/files/photos` in the chroot (created if
+missing), and `--folder /root/music:ro` shares any other folder read-only.
+It prints what to type into the app and where to fetch the guest's key.
+Fetch it with your admin login, not a client key, which can only jump
+through to the phone.
+
+```
+core-vps.sh --guest-access anna --folder photos   # replaces the folder list
+core-vps.sh --revoke-guest anna                   # files stay
+core-vps.sh --list-guests                         # with folder sizes
+core-vps.sh --sync-guests                         # after a phone reset
+```
+
 **Move to a new phone.** Export the old phone's identity (its WireGuard
 and SSH host keys, the VPS login key and extra authorized keys), import it
 on the new phone, then run the installer with the same VPS and device
@@ -215,6 +239,13 @@ ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --uninstall'
   itself grants that key a `command=...,restrict,port-forwarding,
   permitopen=` entry — it can jump through, but it cannot open a shell on
   the VPS itself, even though the key is technically "authorized" there.
+- A guest key (`--add-guest`) is tied on the VPS to one forced command:
+  the hop to that guest's own user on the phone. It gets no shell or
+  forwarding on the VPS. On the phone, guests are chrooted to a room that
+  holds only bind mounts of their folders, read-only is enforced by the
+  mount, and the phone accepts each guest's route key only from the VPS's
+  tunnel address. Someone who controls the VPS can read guest folders,
+  but they could already reach the phone as root.
 - `wstunnel`'s server is started with `--restrict-to`, so it only ever
   forwards to the local WireGuard listener — without it, anyone who found
   the port could use it as an open proxy.
@@ -237,13 +268,14 @@ bash tests/run_tests.sh
 
 Runs the full local regression suite — no real phone or VPS required.
 Everything is exercised against mocked chroots, systemd units, and SSH
-calls. 33 test files, covering install/uninstall, address allocation,
+calls. 34 test files, covering install/uninstall, address allocation,
 handoff validation, the generated Magisk scripts' actual shell syntax,
 the client add/revoke/list flow including the VPS-side access
 restriction above, VPS authorization, several phones per VPS, host key
 pinning, domains and certificates (with a fake certbot), identity
-export/import, and the Windows client script (run under PowerShell when
-`pwsh` is installed).
+export/import, guest file access, and the Windows client script (run under
+PowerShell when `pwsh` is installed). `SERVERINATOR_TEST_REAL_GUESTS=1`
+(as root) also runs the guest chain end to end with two real sshds.
 
 ## Known limitations and roadmap
 
@@ -253,10 +285,10 @@ a private backlog.
 
 ### Works today, but with a sharp edge
 
-- **Everything is root-only.** There's no concept yet of a lower-privilege
-  user inside the chroot, or of giving a client limited access instead of
-  full root. Every added client gets the same level of access the owner
-  has.
+- **Clients are root; guests are files only.** `--add-client` still gives
+  the same root access the owner has. `--add-guest` gives files-only access
+  to chosen folders. Nothing in between yet, such as a shell user without
+  root.
 
 ### Not yet built
 

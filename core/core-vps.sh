@@ -10,6 +10,11 @@ set -euo pipefail
 #   bash core-vps.sh --add-client LABEL     # after install, the tunnel must be up
 #   bash core-vps.sh --revoke-client LABEL
 #   bash core-vps.sh --list-clients [--device NAME]
+#   bash core-vps.sh --add-guest NAME [--folder NAME|PATH[:ro|:rw]]... [--pubkey KEY|FILE]
+#   bash core-vps.sh --guest-access NAME [--folder ...]...   # replaces the folder list
+#   bash core-vps.sh --revoke-guest NAME
+#   bash core-vps.sh --list-guests [--device NAME]
+#   bash core-vps.sh --sync-guests [--device NAME]          # after a phone reset
 #   bash core-vps.sh --list-devices
 #   bash core-vps.sh --remove-device NAME
 #   bash core-vps.sh --set-domain DOMAIN [--acme-email EMAIL | --tls-cert FILE --tls-key FILE]
@@ -46,6 +51,7 @@ if [[ "$DEV" == "1" ]]; then
     : "${SERVERINATOR_BACK_HANDOFF_PATH:=$DEV_ROOT/back-handoff.json}"
     : "${SERVERINATOR_VPS_ADMIN_HOME:=$DEV_ROOT/root}"
     : "${SERVERINATOR_LETSENCRYPT_DIR:=$DEV_ROOT/etc/letsencrypt}"
+    : "${SERVERINATOR_GUEST_HOME:=$DEV_ROOT/var/lib/serverinator-files}"
 fi
 
 WG_DIR="${SERVERINATOR_WG_DIR:-/etc/wireguard}"
@@ -68,6 +74,10 @@ TLS_STATE="$WG_KEY_DIR/tls.json"
 # --add-client, --verify, --list-devices and the orchestrator.
 DEVICES_DIR="${SERVERINATOR_DEVICES_DIR:-$WG_KEY_DIR/devices}"
 SSH_ALIAS_DEFAULT="serverinated"
+# Guest file access: records, and the VPS user guests' SFTP apps log in as.
+GUESTS_DIR="${SERVERINATOR_GUESTS_DIR:-$WG_KEY_DIR/guests}"
+GUEST_VPS_USER="${SERVERINATOR_GUEST_USER:-serverinator-files}"
+GUEST_VPS_HOME="${SERVERINATOR_GUEST_HOME:-/var/lib/serverinator-files}"
 SSH_ENABLED=0
 SSH_USER="root"
 SSH_PHONE_PORT=22
@@ -86,6 +96,10 @@ VPS_IP=""
 SSH_ALIAS=""
 CLIENT_KEYS_MODE=""
 CLIENT_LABEL=""
+GUEST_NAME=""
+GUEST_FOLDERS=()     # --folder, repeatable
+GUEST_PUBKEY=""      # --pubkey: the guest's own key instead of a generated one
+GUEST_RECORD=""
 SELECTED_DEVICE=""   # --device / --remove-device
 DEVICE_RECORD=""     # DEVICES_DIR/<device>.json once selected
 
@@ -154,6 +168,28 @@ parse_args() {
                 validate_client_label "$CLIENT_LABEL"
                 ;;
             --list-clients) MODE="list-clients"; shift ;;
+            --add-guest|--guest-access|--revoke-guest)
+                MODE="${1#--}"; shift
+                [[ $# -gt 0 ]] || die "--$MODE requires a NAME"
+                GUEST_NAME="$1"; shift
+                validate_guest_name "$GUEST_NAME"
+                ;;
+            --list-guests) MODE="list-guests"; shift ;;
+            --sync-guests) MODE="sync-guests"; shift ;;
+            --folder)
+                shift
+                [[ $# -gt 0 ]] || die "--folder requires NAME or PATH (optionally :ro or :rw)"
+                GUEST_FOLDERS+=("$1"); shift
+                ;;
+            --pubkey)
+                shift
+                [[ $# -gt 0 ]] || die "--pubkey requires a key or a .pub file"
+                if [[ -f "$1" ]]; then GUEST_PUBKEY="$(awk 'NF {print $1" "$2; exit}' "$1")"
+                else GUEST_PUBKEY="$(awk '{print $1" "$2}' <<< "$1")"; fi
+                shift
+                [[ "$GUEST_PUBKEY" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+={0,2}$ ]] \
+                    || die "--pubkey: expected an ssh-ed25519 public key (or a file holding one)"
+                ;;
             --domain|--set-domain)
                 [[ "$1" == --set-domain ]] && MODE="set-domain"
                 shift
@@ -218,7 +254,8 @@ parse_args() {
             validate_host "$VPS_IP"
             [[ -n "$SSH_ALIAS" ]] || SSH_ALIAS="$SSH_ALIAS_DEFAULT"
             ;;
-        verify|uninstall|list-clients|list-devices|remove-device) ;;
+        verify|uninstall|list-clients|list-devices|remove-device|list-guests|sync-guests) ;;
+        add-guest|guest-access|revoke-guest) ;;
         set-domain)
             [[ "$REMOVE_DOMAIN" == 1 || -n "$VPS_DOMAIN" ]] || die "--set-domain requires a DOMAIN"
             ;;
@@ -226,6 +263,9 @@ parse_args() {
             [[ -n "$CLIENT_LABEL" ]] || die "--add-client/--revoke-client requires a LABEL"
             ;;
     esac
+    [[ ${#GUEST_FOLDERS[@]} -eq 0 || "$MODE" == add-guest || "$MODE" == guest-access ]] \
+        || die "--folder goes with --add-guest or --guest-access"
+    [[ -z "$GUEST_PUBKEY" || "$MODE" == add-guest ]] || die "--pubkey goes with --add-guest"
 }
 
 # ─────────────────────────────────────────────
@@ -678,10 +718,12 @@ save_tls_state() {
 vps_public_host() { printf '%s\n' "${VPS_DOMAIN:-$VPS_IP}"; }
 
 # IPv4 addresses DOMAIN resolves to, one per line (mocked in tests).
-resolve_domain() { getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u; }
+# getent exits 2 for a name that doesn't resolve; with pipefail that would end
+# the whole run silently instead of reaching the "doesn't resolve" message.
+resolve_domain() { { getent ahostsv4 "$1" 2>/dev/null || :; } | awk '{print $1}' | sort -u; }
 
 # This machine's own IPv4 addresses (mocked in tests).
-local_ipv4s() { ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}'; }
+local_ipv4s() { { ip -4 -o addr show 2>/dev/null || :; } | awk '{split($4, a, "/"); print a[1]}'; }
 
 # Something already listening on TCP port 80? (mocked in tests)
 port80_in_use() { have_cmd ss && ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; }
@@ -711,7 +753,7 @@ check_domain_points_here() {
   Create a DNS A record:  $VPS_DOMAIN -> $target
   then run this again (new records can take a few minutes to appear)."
     fi
-    mine="$(local_ipv4s; [[ "$VPS_IP" =~ ^[0-9.]+$ ]] && printf '%s\n' "$VPS_IP")"
+    mine="$(local_ipv4s; if [[ "$VPS_IP" =~ ^[0-9.]+$ ]]; then printf '%s\n' "$VPS_IP"; fi)"
     while IFS= read -r a; do
         if grep -qxF -- "$a" <<< "$mine"; then
             ok "$VPS_DOMAIN points to this VPS ($a)"
@@ -1600,6 +1642,484 @@ list_clients() {
 }
 
 # ─────────────────────────────────────────────
+# Guest file access (--add-guest and friends)
+# ─────────────────────────────────────────────
+#
+# A guest uses any SFTP app (FileZilla, WinSCP, ...) to reach chosen folders
+# on one phone. The app logs in to this VPS as GUEST_VPS_USER with the
+# guest's key. That key's authorized_keys line forces a command, so the VPS
+# ignores what the app asked for and instead opens SSH to the phone over the
+# tunnel, as the guest's phone user, with a route key only this VPS holds,
+# and asks for SFTP there. The two byte streams are joined, so the app
+# talks to the phone's internal-sftp without knowing it. On the phone the
+# guest is chrooted to a room of bind-mounted folders (core/guest-helper.sh).
+#
+# Records: GUESTS_DIR/NAME.json. The authorized_keys of GUEST_VPS_USER is
+# rebuilt from them (write_guest_routes), so it never drifts.
+
+GUEST_HELPER_PHONE="/usr/local/sbin/serverinator-guests"
+GUEST_FILES_DIR="/srv/files"   # where a bare folder name lives on the phone
+
+validate_guest_name() {
+    [[ "$1" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] \
+        || die "Invalid guest name '${1}': 1-31 characters, lowercase letters/digits/_/-, starting with a letter"
+}
+
+guest_record_path() { printf '%s/%s.json\n' "$GUESTS_DIR" "$1"; }
+
+guest_names() { # [DEVICE]
+    local f name
+    for f in "$GUESTS_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        name="${f##*/}"; name="${name%.json}"
+        [[ -z "${1:-}" || "$(json_get "$f" device)" == "$1" ]] && printf '%s\n' "$name"
+    done
+    return 0
+}
+
+# normalize_folder_spec SPEC -> "MODE:PATH"
+#   photos            -> rw:/srv/files/photos
+#   photos:ro         -> ro:/srv/files/photos
+#   /data/music:rw    -> rw:/data/music
+# The phone checks the path again and refuses system folders.
+normalize_folder_spec() {
+    local spec="$1" mode=rw path
+    case "$spec" in
+        *:ro) mode=ro; path="${spec%:ro}" ;;
+        *:rw) mode=rw; path="${spec%:rw}" ;;
+        *)    path="$spec" ;;
+    esac
+    path="${path%/}"
+    if [[ "$path" != /* ]]; then
+        [[ "$path" =~ ^[A-Za-z0-9._@+-]+$ && "$path" != . && "$path" != .. ]] \
+            || die "Folder '$spec': use a plain name (kept in $GUEST_FILES_DIR) or a full path"
+        path="$GUEST_FILES_DIR/$path"
+    fi
+    [[ "$path" =~ ^(/[A-Za-z0-9._@+-]+)+$ && "/$path/" != *"/../"* && "/$path/" != *"/./"* ]] \
+        || die "Folder '$spec': only letters, digits and ._@+- are allowed in folder names"
+    printf '%s:%s\n' "$mode" "$path"
+}
+
+# Asks for the folders when none were given on the command line. Fills
+# GUEST_FOLDERS with normalized specs.
+ask_guest_folders() { # NAME [CURRENT...]
+    local name="$1" answer mode
+    shift
+    [[ -t 0 ]] || die "No folders given. Use --folder NAME[:ro|:rw] (repeatable), or run this in a terminal to be asked"
+    echo ""
+    if [[ $# -gt 0 ]]; then
+        echo "  '$name' can use these folders now:"
+        printf '    %s\n' "$@"
+        echo "  Enter the complete new list below."
+    fi
+    echo "  Which folders may '$name' use? One per line, empty line to finish."
+    echo "  A plain name (photos) lives in $GUEST_FILES_DIR on the phone and is created if"
+    echo "  missing; a full path (/root/music) shares a folder you already have."
+    GUEST_FOLDERS=()
+    while :; do
+        read -r -p "  Folder: " answer || break
+        [[ -n "$answer" ]] || break
+        answer="$(normalize_folder_spec "$answer")" || continue
+        read -r -p "  Read-only or read-write? [ro/RW]: " mode || mode=""
+        [[ "${mode,,}" == ro ]] && answer="ro:${answer#*:}" || answer="rw:${answer#*:}"
+        GUEST_FOLDERS+=("$answer")
+    done
+    ((${#GUEST_FOLDERS[@]} > 0)) || die "No folders chosen; nothing changed"
+}
+
+# Turns the --folder values into normalized specs (or asks for them).
+resolve_guest_folders() { # NAME [CURRENT...]
+    local -a given=("${GUEST_FOLDERS[@]+"${GUEST_FOLDERS[@]}"}") spec
+    if ((${#given[@]} == 0)); then
+        ask_guest_folders "$@"
+        return 0
+    fi
+    GUEST_FOLDERS=()
+    for spec in "${given[@]}"; do GUEST_FOLDERS+=("$(normalize_folder_spec "$spec")"); done
+}
+
+# "rw:/srv/files/photos" -> "photos (read-write)"
+describe_folder() {
+    local mode="${1%%:*}" path="${1#*:}"
+    printf '%s (%s, %s)' "${path##*/}" "$path" "$([[ "$mode" == ro ]] && echo read-only || echo read-write)"
+}
+
+guest_folder_specs() { # RECORD -> MODE:PATH lines
+    json_query -r '.folders[] | "\(.mode):\(.path)"' < "$1"
+}
+
+# The VPS system user guests log in as. Its password is "*" (never matches,
+# but not "locked": sshd with UsePAM no refuses locked accounts).
+ensure_guest_vps_user() {
+    mkdir -p "$GUEST_VPS_HOME/.ssh" "$GUEST_VPS_HOME/routes"
+    if [[ "$DEV" != 1 ]]; then
+        if ! getent passwd "$GUEST_VPS_USER" >/dev/null; then
+            useradd --system --home-dir "$GUEST_VPS_HOME" --shell /bin/sh \
+                --comment "ServerInator guest file access" "$GUEST_VPS_USER" \
+                || die "Could not create the VPS user $GUEST_VPS_USER"
+            mkdir -p "$WG_KEY_DIR"; touch "$WG_KEY_DIR/guest-user-owned"
+            info "Created the VPS user '$GUEST_VPS_USER' that guests log in as"
+        fi
+        usermod -p '*' "$GUEST_VPS_USER"
+        chown -R "$GUEST_VPS_USER:" "$GUEST_VPS_HOME"
+    fi
+    chmod 750 "$GUEST_VPS_HOME"
+    chmod 700 "$GUEST_VPS_HOME/.ssh" "$GUEST_VPS_HOME/routes"
+}
+
+# The VPS's own sshd must let GUEST_VPS_USER in with a key from
+# .ssh/authorized_keys. Warn (never change) when it looks like it won't.
+check_guest_vps_sshd() {
+    [[ "$DEV" != 1 ]] && have_cmd sshd || return 0
+    local eff
+    eff="$(sshd -T -C "user=$GUEST_VPS_USER,host=localhost,addr=127.0.0.1" 2>/dev/null)" || return 0
+    local allow_u allow_g
+    allow_u="$(awk 'tolower($1)=="allowusers" {$1=""; print}' <<< "$eff")"
+    allow_g="$(awk 'tolower($1)=="allowgroups" {$1=""; print}' <<< "$eff")"
+    if [[ -n "$allow_u$allow_g" && " $allow_u " != *" $GUEST_VPS_USER "* ]]; then
+        warn "This VPS's sshd only lets some users in (AllowUsers/AllowGroups)."
+        warn "  Add $GUEST_VPS_USER to AllowUsers in /etc/ssh/sshd_config and reload sshd, or guests can't log in."
+    fi
+    [[ "$(awk 'tolower($1)=="pubkeyauthentication" {print $2}' <<< "$eff")" != no ]] \
+        || warn "sshd has PubkeyAuthentication no for $GUEST_VPS_USER; guests log in with keys, so they can't connect."
+    awk 'tolower($1)=="authorizedkeysfile"' <<< "$eff" | grep -q '\.ssh/authorized_keys' \
+        || warn "sshd doesn't read ~/.ssh/authorized_keys for $GUEST_VPS_USER; guests can't connect."
+    # A forced command replaces the "sftp" subsystem request only when sshd
+    # has that subsystem configured; otherwise the request fails first.
+    awk 'tolower($1)=="subsystem" && $2=="sftp"' <<< "$eff" | grep -q . \
+        || warn "sshd has no 'Subsystem sftp' line; add 'Subsystem sftp internal-sftp' to /etc/ssh/sshd_config and reload sshd, or SFTP apps can't connect."
+    [[ -z "$(awk 'tolower($1)=="forcecommand"' <<< "$eff")" ]] \
+        || warn "sshd has a ForceCommand for $GUEST_VPS_USER; it overrides the guest routing."
+}
+
+# The VPS's SSH port, for the guest's app.
+vps_ssh_port() {
+    local port=""
+    [[ "$DEV" != 1 ]] && have_cmd sshd && port="$(sshd -T 2>/dev/null | awk 'tolower($1)=="port" {print $2; exit}')"
+    printf '%s\n' "${port:-22}"
+}
+
+# One authorized_keys line: this guest key may only run the hop to its phone.
+# The hop must ask for the "sftp" subsystem: the phone's ForceCommand
+# internal-sftp refuses plain command sessions.
+_guest_route_line() { # NAME PUBKEY DEVICE PHONE_IP PORT HOSTKEY
+    local name="$1" pub="$2" device="$3" ip="$4" port="$5" hostkey="$6" kh check
+    kh="$GUEST_VPS_HOME/routes/known_hosts_${device}"
+    if [[ -n "$hostkey" ]]; then
+        check="-o StrictHostKeyChecking=yes -o HostKeyAlias=serverinator-${device}"
+    else
+        check="-o StrictHostKeyChecking=accept-new"
+    fi
+    printf 'command="exec ssh -q -T -F /dev/null -o BatchMode=yes %s -o UserKnownHostsFile=%s -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o KexAlgorithms=curve25519-sha256,curve25519-sha256@libssh.org -o HostKeyAlgorithms=ssh-ed25519 -o IdentitiesOnly=yes -i %s -p %s %s@%s -s sftp",restrict %s serverinator-guest:%s\n' \
+        "$check" "$kh" "$GUEST_VPS_HOME/routes/$name" "$port" "$name" "$ip" "$pub" "$name"
+}
+
+# Rebuilds GUEST_VPS_USER's authorized_keys (and the pinned phone host keys)
+# from the guest records. VPS-only: works with the tunnel down. Run after
+# every guest change, a reinstall (the phone's address may change) and
+# --remove-device.
+write_guest_routes() {
+    local -a names=()
+    mapfile -t names < <(guest_names)
+    if ((${#names[@]} == 0)) && [[ ! -d "$GUEST_VPS_HOME/.ssh" ]]; then
+        return 0
+    fi
+    ensure_guest_vps_user
+    local name rec device drec ip port hostkey pub staged
+    staged="$(mktemp)" || die "Could not create a temp file"
+    for name in "${names[@]}"; do
+        rec="$(guest_record_path "$name")"
+        device="$(json_get "$rec" device)"
+        drec="$(device_record_path "$device")"
+        if [[ ! -f "$drec" ]]; then
+            warn "Guest '$name' belongs to phone '$device', which is gone; skipped"
+            continue
+        fi
+        ip="$(json_get "$drec" ssh_phone_ip)"
+        port="$(json_get_num "$drec" ssh_port)"; port="${port:-22}"
+        hostkey="$(json_get "$drec" ssh_host_pubkey)"
+        pub="$(json_get "$rec" guest_pubkey)"
+        is_plain_pubkey "$pub" || { warn "Guest '$name' has a malformed key in $rec; skipped"; continue; }
+        [[ -f "$GUEST_VPS_HOME/routes/$name" ]] || { warn "Route key for '$name' is missing; run --sync-guests"; continue; }
+        validate_ipv4 "$ip" "phone tunnel IPv4"
+        validate_port "$port"
+        if [[ -n "$hostkey" ]]; then
+            printf 'serverinator-%s %s\n' "$device" "$hostkey" > "$GUEST_VPS_HOME/routes/known_hosts_${device}"
+        fi
+        _guest_route_line "$name" "$pub" "$device" "$ip" "$port" "$hostkey" >> "$staged"
+    done
+    reconcile_file "$GUEST_VPS_HOME/.ssh/authorized_keys" 600 < "$staged" >/dev/null
+    rm -f "$staged"
+    if [[ "$DEV" != 1 ]]; then
+        chown -R "$GUEST_VPS_USER:" "$GUEST_VPS_HOME/.ssh" "$GUEST_VPS_HOME/routes"
+    fi
+    rm -f "$GUEST_VPS_HOME/.ssh/authorized_keys.bak"
+}
+
+# Makes sure the phone can host guests (it may run an older ServerInator).
+_require_phone_guest_helper() {
+    local v
+    v="$(_phone_ssh "$GUEST_HELPER_PHONE" version 2>/dev/null)" || v=""
+    [[ "$v" =~ ^[0-9]+$ ]] \
+        || die "Phone '$DEVICE_NAME' can't host guests yet, or isn't reachable. Update it first (re-run serverinator.sh on the phone; nothing else changes), check the tunnel with --verify, then try again."
+}
+
+# Pushes one guest to the phone. Prints the phone's UID for it.
+_phone_guest_set() { # NAME UID SPEC...
+    local name="$1" uid="$2" out
+    shift 2
+    local -a args=(set "$name" --from "${VPS_WG_SUBNET}.1")
+    [[ -z "$uid" ]] || args+=(--uid "$uid")
+    out="$(awk '{print $1" "$2; exit}' "$GUEST_VPS_HOME/routes/$name.pub" \
+        | _phone_ssh "$GUEST_HELPER_PHONE" "${args[@]}" "$@")" \
+        || { printf '%s\n' "$out" >&2; return 1; }
+    printf '%s\n' "$out" | grep -v '^uid=' | sed 's/^/  phone: /' >&2
+    out="$(printf '%s\n' "$out" | sed -n 's/^uid=\([0-9][0-9]*\)$/\1/p' | tail -n 1)"
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"
+}
+
+_write_guest_record() { # NAME UID PUBKEY GENERATED CREATED SPEC...
+    local name="$1" uid="$2" pub="$3" generated="$4" created="$5" spec staged
+    shift 5
+    mkdir -p "$GUESTS_DIR"; chmod 700 "$GUESTS_DIR"
+    staged="$(mktemp "$GUESTS_DIR/.${name}.XXXXXX")"
+    {
+        for spec in "$@"; do printf '%s\n' "$spec"; done
+    } | json_query -R -s \
+        --arg name "$name" --arg device "$DEVICE_NAME" --argjson uid "$uid" \
+        --arg pub "$pub" --argjson generated "$generated" --arg created "$created" '
+        {name: $name, device: $device, uid: $uid, guest_pubkey: $pub,
+         key_generated: $generated, created: $created,
+         folders: [split("\n")[] | select(length > 0)
+                   | {mode: (split(":")[0]), path: (split(":")[1:] | join(":"))}]}' \
+        > "$staged" || { rm -f "$staged"; die "Could not write the guest record"; }
+    chmod 600 "$staged"
+    mv "$staged" "$(guest_record_path "$name")"
+}
+
+_guest_connection_card() { # NAME KEYFILE SPEC...
+    local name="$1" keyfile="$2" spec fp=""
+    shift 2
+    [[ -f "${SERVERINATOR_VPS_HOSTKEY_FILE:-/etc/ssh/ssh_host_ed25519_key.pub}" ]] \
+        && fp="$(ssh_key_fingerprint "$(vps_host_pubkey)" | awk '{print $1}')"
+    echo ""
+    echo "  '$name' can connect with any SFTP app (FileZilla, WinSCP, an Android SFTP app):"
+    echo "    Protocol : SFTP"
+    echo "    Host     : $(vps_public_host)"
+    echo "    Port     : $(vps_ssh_port)"
+    echo "    User     : $GUEST_VPS_USER"
+    if [[ -n "$keyfile" ]]; then
+        echo "    Key file : $keyfile   (give this file to $name; it is the login)"
+    else
+        echo "    Key      : the key $name sent you"
+    fi
+    for spec in "$@"; do echo "    Folder   : $(describe_folder "$spec")"; done
+    [[ -z "$fp" ]] || echo "    The app asks to trust the server once; its key should be $fp"
+    if [[ -n "$keyfile" ]]; then
+        echo ""
+        echo "  Copy the key file off this VPS:"
+        echo "    $(fetch_hint_file "$keyfile")"
+    fi
+    echo ""
+}
+
+# Like fetch_hint, for a file that isn't a script.
+fetch_hint_file() { # PATH
+    local name="${1##*/}" user="${SSH_VPS_USER:-root}"
+    if [[ "$user" == root ]]; then
+        printf '%s' "scp root@$(vps_public_host):$1 ."
+    else
+        printf '%s' "ssh ${user}@$(vps_public_host) 'sudo cat $1' > $name"
+    fi
+}
+
+add_guest() {
+    local name="$GUEST_NAME" rec pub="" generated=0 gk="" uid created
+    [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--add-guest requires root"
+    rec="$(guest_record_path "$name")"
+    [[ ! -f "$rec" ]] || die "Guest '$name' already exists (phone $(json_get "$rec" device)). Change folders with --guest-access $name, or --revoke-guest $name first"
+    _load_phone_state
+    resolve_guest_folders "$name"
+    _require_phone_guest_helper
+
+    require_cmd ssh-keygen
+    if [[ -n "$GUEST_PUBKEY" ]]; then
+        pub="$GUEST_PUBKEY"
+    else
+        gk="$SSH_KEY_DIR/guest_${name}"
+        rm -f "$gk" "$gk.pub"
+        mkdir -p "$SSH_KEY_DIR"; chmod 700 "$SSH_KEY_DIR"
+        ssh-keygen -q -t ed25519 -N '' -C "serverinator-guest:${name}" -f "$gk"
+        chmod 600 "$gk"
+        pub="$(awk '{print $1" "$2}' "$gk.pub")"
+        generated=1
+    fi
+
+    ensure_guest_vps_user
+    local rk="$GUEST_VPS_HOME/routes/$name"
+    rm -f "$rk" "$rk.pub"
+    ssh-keygen -q -t ed25519 -N '' -C "serverinator-route:${name}" -f "$rk"
+
+    uid="$(_phone_guest_set "$name" "" "${GUEST_FOLDERS[@]}")" || {
+        rm -f "$rk" "$rk.pub"; [[ -z "$gk" ]] || rm -f "$gk" "$gk.pub"
+        die "The phone refused or couldn't set up guest '$name' (see above)"
+    }
+    created="$(date -u +%Y-%m-%d)"
+    _write_guest_record "$name" "$uid" "$pub" "$generated" "$created" "${GUEST_FOLDERS[@]}"
+    write_guest_routes
+    check_guest_vps_sshd
+    ok "Guest '$name' added on $DEVICE_NAME"
+    _guest_connection_card "$name" "$gk" "${GUEST_FOLDERS[@]}"
+}
+
+# Loads a guest's record and the phone it lives on.
+_load_guest() { # NAME -> sets GUEST_RECORD
+    GUEST_RECORD="$(guest_record_path "$1")"
+    [[ -f "$GUEST_RECORD" ]] || die "No guest named '$1' (known: $(guest_names | tr '\n' ' '))"
+    local device
+    device="$(json_get "$GUEST_RECORD" device)"
+    [[ -z "$SELECTED_DEVICE" || "$SELECTED_DEVICE" == "$device" ]] \
+        || die "Guest '$1' is on phone '$device', not '$SELECTED_DEVICE'"
+    SELECTED_DEVICE="$device"
+}
+
+guest_access() {
+    local name="$GUEST_NAME" uid
+    [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--guest-access requires root"
+    _load_guest "$name"
+    _load_phone_state
+    local -a current=()
+    mapfile -t current < <(guest_folder_specs "$GUEST_RECORD")
+    local spec described=()
+    for spec in "${current[@]}"; do described+=("$(describe_folder "$spec")"); done
+    resolve_guest_folders "$name" "${described[@]}"
+    [[ -f "$GUEST_VPS_HOME/routes/$name.pub" ]] || die "Route key for '$name' is missing; run --sync-guests first"
+    _require_phone_guest_helper
+    uid="$(_phone_guest_set "$name" "$(json_get_num "$GUEST_RECORD" uid)" "${GUEST_FOLDERS[@]}")" \
+        || die "The phone refused or couldn't change guest '$name' (see above)"
+    _write_guest_record "$name" "$uid" "$(json_get "$GUEST_RECORD" guest_pubkey)" \
+        "$(json_get_num "$GUEST_RECORD" key_generated)" "$(json_get "$GUEST_RECORD" created)" "${GUEST_FOLDERS[@]}"
+    ok "Guest '$name' can now use:"
+    for spec in "${GUEST_FOLDERS[@]}"; do echo "    $(describe_folder "$spec")"; done
+}
+
+revoke_guest() {
+    local name="$GUEST_NAME"
+    [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--revoke-guest requires root"
+    _load_guest "$name"
+    # The VPS side first: once the route line is gone the key can't reach
+    # the phone, even if the phone can't be cleaned up right now.
+    rm -f "$GUEST_RECORD" "$GUEST_VPS_HOME/routes/$name" "$GUEST_VPS_HOME/routes/$name.pub" \
+        "$SSH_KEY_DIR/guest_${name}" "$SSH_KEY_DIR/guest_${name}.pub"
+    write_guest_routes
+    info "Guest '$name' can no longer log in"
+    if [[ -f "$(device_record_path "$SELECTED_DEVICE")" ]]; then
+        _load_phone_state
+        if _phone_ssh "$GUEST_HELPER_PHONE" remove "$name" >/dev/null; then
+            info "Removed '$name' from $DEVICE_NAME (shared folders and their files stay)"
+        else
+            warn "Couldn't reach $DEVICE_NAME to remove the '$name' account there; run --sync-guests later to tidy up"
+        fi
+    fi
+}
+
+list_guests() {
+    local -a names=()
+    mapfile -t names < <(guest_names "$SELECTED_DEVICE")
+    echo ""
+    if ((${#names[@]} == 0)); then
+        info "No guests${SELECTED_DEVICE:+ on $SELECTED_DEVICE}. Add one: --add-guest NAME"
+        return 0
+    fi
+    local name rec spec key fp
+    printf '  %-16s %-12s %-10s %s\n' GUEST PHONE CREATED KEY
+    for name in "${names[@]}"; do
+        rec="$(guest_record_path "$name")"
+        key="$(json_get "$rec" guest_pubkey)"
+        fp="$(ssh_key_fingerprint "$key" | awk '{print $1}')"
+        printf '  %-16s %-12s %-10s %s\n' "$name" "$(json_get "$rec" device)" "$(json_get "$rec" created)" "${fp:-?}"
+        while IFS= read -r spec; do
+            printf '  %-16s   %s\n' "" "$(describe_folder "$spec")"
+        done < <(guest_folder_specs "$rec")
+    done
+    echo ""
+    # Folder sizes come from the phone; best effort.
+    local device out
+    while IFS= read -r device; do
+        [[ -f "$(device_record_path "$device")" ]] || continue
+        SELECTED_DEVICE="$device"
+        ( _load_phone_state >/dev/null
+          if out="$(_phone_ssh "$GUEST_HELPER_PHONE" list 2>/dev/null)"; then
+              echo "  Folder sizes on $device:"
+              printf '%s\n' "$out" | awk '$1 ~ /^(ro|rw)$/ {print $2" "$3}' | sort -u \
+                  | while read -r p s; do printf '    %-40s %s\n' "$p" "$s"; done
+          else
+              info "$device isn't reachable right now; folder sizes skipped"
+          fi ) || true
+    done < <(for name in "${names[@]}"; do json_get "$(guest_record_path "$name")" device; done | sort -u)
+    echo ""
+    info "Add: --add-guest NAME   Change folders: --guest-access NAME   Remove: --revoke-guest NAME"
+}
+
+# Makes the phone match the VPS's guest records: recreates missing guests
+# (a reset or replaced phone), and removes guests the VPS no longer knows.
+sync_guests() {
+    [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--sync-guests requires root"
+    _load_phone_state
+    _require_phone_guest_helper
+    local -a names=() on_phone=()
+    mapfile -t names < <(guest_names "$DEVICE_NAME")
+    ensure_guest_vps_user
+    local name rec uid rk n=0
+    for name in "${names[@]}"; do
+        rec="$(guest_record_path "$name")"
+        rk="$GUEST_VPS_HOME/routes/$name"
+        if [[ ! -f "$rk" || ! -f "$rk.pub" ]]; then
+            rm -f "$rk" "$rk.pub"
+            ssh-keygen -q -t ed25519 -N '' -C "serverinator-route:${name}" -f "$rk"
+        fi
+        local -a specs=()
+        mapfile -t specs < <(guest_folder_specs "$rec")
+        uid="$(_phone_guest_set "$name" "$(json_get_num "$rec" uid)" "${specs[@]}")" \
+            || { warn "Could not set up '$name' on $DEVICE_NAME"; continue; }
+        n=$((n + 1))
+    done
+    mapfile -t on_phone < <(_phone_ssh "$GUEST_HELPER_PHONE" names) || on_phone=()
+    for name in "${on_phone[@]}"; do
+        [[ -n "$name" ]] || continue
+        if [[ ! -f "$(guest_record_path "$name")" ]]; then
+            _phone_ssh "$GUEST_HELPER_PHONE" remove "$name" >/dev/null \
+                && info "Removed '$name' from $DEVICE_NAME (not a guest on this VPS any more)"
+        fi
+    done
+    write_guest_routes
+    ok "$n guest(s) in sync on $DEVICE_NAME"
+}
+
+# --remove-device: the phone's guests go with it.
+remove_device_guests() { # DEVICE
+    local name
+    while IFS= read -r name; do
+        rm -f "$(guest_record_path "$name")" "$GUEST_VPS_HOME/routes/$name" "$GUEST_VPS_HOME/routes/$name.pub" \
+            "$SSH_KEY_DIR/guest_${name}" "$SSH_KEY_DIR/guest_${name}.pub"
+        info "Guest '$name' removed with the phone"
+    done < <(guest_names "$1")
+    rm -f "$GUEST_VPS_HOME/routes/known_hosts_$1"
+    write_guest_routes
+}
+
+# --uninstall: the guest login user, if we created it.
+uninstall_guest_access() {
+    if [[ -f "$WG_KEY_DIR/guest-user-owned" && "$DEV" != 1 ]] && getent passwd "$GUEST_VPS_USER" >/dev/null; then
+        pkill -KILL -u "$GUEST_VPS_USER" 2>/dev/null || true
+        userdel -r "$GUEST_VPS_USER" 2>/dev/null || userdel "$GUEST_VPS_USER" || warn "Could not remove the VPS user $GUEST_VPS_USER"
+        info "Removed the guest login user $GUEST_VPS_USER"
+    fi
+    [[ "$DEV" != 1 ]] || rm -rf "$GUEST_VPS_HOME"
+}
+
+# ─────────────────────────────────────────────
 # Step 6: Back-handoff
 # ─────────────────────────────────────────────
 
@@ -1913,6 +2433,7 @@ remove_device() {
     done < <( { [[ -f "$SSH_KEY_DIR/owner_${name}.pub" ]] && echo "$SSH_KEY_DIR/owner_${name}.pub"; device_client_pubs "$name"; } )
     rm -f "$SSH_KEY_DIR/client-setup-owner-${name}".{sh,ps1} "$SSH_KEY_DIR"/client-setup-*-"${name}".{sh,ps1}
     rm -f "$record"
+    remove_device_guests "$name"
     info "Phone '$name' removed from this VPS."
     [[ -n "$(device_names)" ]] || info "No phones left; the VPS services stay installed (use --uninstall to remove everything)."
 }
@@ -1967,6 +2488,7 @@ uninstall_vps() {
         warn "wstunnel was not installed by us — not removing the binary"
     fi
     _remove_all_vps_jump_entries
+    uninstall_guest_access
     if [[ -f "$TLS_STATE" ]]; then
         local domain
         domain="$(json_get "$TLS_STATE" domain)"
@@ -2058,6 +2580,11 @@ main() {
         revoke-client)  revoke_client;  return ;;
         list-clients)   list_clients;   return ;;
         set-domain)     set_domain;     return ;;
+        add-guest)      add_guest;      return ;;
+        guest-access)   guest_access;   return ;;
+        revoke-guest)   revoke_guest;   return ;;
+        list-guests)    list_guests;    return ;;
+        sync-guests)    sync_guests;    return ;;
     esac
 
     # MODE=setup
@@ -2088,6 +2615,8 @@ main() {
 
     step 6/6 "Generating back-handoff"
     generate_back_handoff
+    # A reinstall can move the phone to another tunnel address.
+    write_guest_routes
 
     info "VPS configured."
     if [[ -n "${OWNER_CLIENT_SETUP_PATH:-}" ]]; then

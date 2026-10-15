@@ -43,7 +43,7 @@ vps() {
     SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$devroot" SERVERINATOR_VPS_IP=203.0.113.9 \
     SERVERINATOR_CERTBOT="$tmp/certbot" DNS_ANSWER="$DNS_ANSWER" MY_IPS="$MY_IPS" PORT80="$PORT80" PORT80_UNIT="$PORT80_UNIT" \
     bash -c 'source "$1"; shift
-        resolve_domain() { [[ -z "$DNS_ANSWER" ]] || printf "%s\n" $DNS_ANSWER; }
+        [[ "${DNS_REAL:-}" == 1 ]] || resolve_domain() { [[ -z "$DNS_ANSWER" ]] || printf "%s\n" $DNS_ANSWER; }
         local_ipv4s() { printf "%s\n" $MY_IPS; }
         port80_in_use() { [[ "$PORT80" == 1 ]]; }
         port80_service() { printf "%s" "$PORT80_UNIT"; }
@@ -89,6 +89,13 @@ assert_contains "$out" "doesn't resolve yet" 'says the name does not resolve'
 assert_contains "$out" "$D -> 203.0.113.9" 'and which A record to create'
 assert_eq "" "$(cat "$FAKE_LOG")" 'certbot not called'
 DNS_ANSWER=203.0.113.9
+
+echo "Test: a name getent can't resolve (exit 2) still gets the message"
+mkdir -p "$tmp/nodns"
+printf '#!/bin/sh\nexit 2\n' > "$tmp/nodns/getent"; chmod +x "$tmp/nodns/getent"
+out="$(PATH="$tmp/nodns:$PATH" DNS_REAL=1 vps --set-domain "$D")"
+assert_contains "$out" "doesn't resolve yet" 'says the name does not resolve instead of stopping silently'
+assert_eq "" "$(cat "$FAKE_LOG")" 'certbot not called'
 
 echo "Test: --set-domain refuses while something that isn't a service holds port 80"
 PORT80=1

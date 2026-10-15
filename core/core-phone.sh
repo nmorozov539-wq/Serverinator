@@ -738,6 +738,95 @@ install_ssh_server() {
     fi
 }
 
+# ── Guest file access ────────────────────────
+#
+# Guests (core-vps.sh --add-guest) are files-only users in the
+# serverinator-guests group: internal-sftp, chrooted to a room of
+# bind-mounted folders. This installs the helper the VPS drives
+# (core/guest-helper.sh) and the sshd rules for the group. The rules live in
+# their own file, included at the very END of sshd_config: a Match block
+# applies to everything after it, so nothing of the main config may follow.
+
+GUEST_SSHD_CONF="/etc/ssh/serverinator-guests.conf"
+GUEST_HELPER="/usr/local/sbin/serverinator-guests"
+
+# The VPS's hop asks for the "sftp" subsystem, and sshd refuses that
+# request (even under ForceCommand internal-sftp) unless some Subsystem sftp
+# line exists. Debian's sshd_config has one; add ours only when it doesn't,
+# because a second definition is an error.
+sshd_has_sftp_subsystem() {
+    local f
+    for f in "$CHROOT/etc/ssh/sshd_config" "$CHROOT/etc/ssh/sshd_config.d/"*.conf; do
+        [[ -f "$f" ]] || continue
+        grep -qiE '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]' "$f" && return 0
+    done
+    return 1
+}
+
+guest_sshd_conf() {
+    echo "# Managed by ServerInator. Guests: files only, locked to their room."
+    sshd_has_sftp_subsystem || echo "Subsystem sftp internal-sftp"
+    cat << 'EOF'
+Match Group serverinator-guests
+    AuthorizedKeysFile /etc/ssh/serverinator-guests/%u
+    ChrootDirectory /srv/guests/%u
+    ForceCommand internal-sftp -u 0002
+    DisableForwarding yes
+    PermitTTY no
+    PermitTunnel no
+EOF
+}
+
+# Keeps "Include GUEST_SSHD_CONF" as the last line of sshd_config.
+ensure_guest_include() {
+    local main="$CHROOT/etc/ssh/sshd_config" inc="Include $GUEST_SSHD_CONF" tmp
+    if [[ -f "$main" ]] && [[ "$(grep -v '^[[:space:]]*$' "$main" | tail -n 1)" == "$inc" ]]; then
+        return 0
+    fi
+    tmp="$(mktemp "$CHROOT/etc/ssh/sshd_config.XXXXXX")" || die "Unable to create sshd_config temp file"
+    {
+        [[ ! -f "$main" ]] || grep -vFx -- "$inc" "$main" || true
+        printf '%s\n' "$inc"
+    } > "$tmp"
+    reconcile_file "$main" 600 "$STATE_DIR/backups" < "$tmp"
+    rm -f "$tmp"
+}
+
+install_guest_support() {
+    [[ "$ENABLE_SSH" == 1 ]] || return 0
+    local src="$CORE_DIR/guest-helper.sh" before after
+    [[ -f "$src" ]] || die "Missing $src next to core-phone.sh"
+    mkdir -p "$CHROOT/usr/local/sbin" "$CHROOT/etc/ssh"
+    before="$(sshd_config_sum)"
+    reconcile_file "$CHROOT$GUEST_HELPER" 755 "$STATE_DIR/backups" < "$src"
+    guest_sshd_conf | reconcile_file "$CHROOT$GUEST_SSHD_CONF" 644 "$STATE_DIR/backups"
+    ensure_sshd_include
+    ensure_guest_include
+    after="$(sshd_config_sum)"
+    [[ "$before" == "$after" ]] || reload_running_sshd
+}
+
+# Checksum of the sshd config files guest support touches.
+sshd_config_sum() {
+    { cat "$CHROOT/etc/ssh/sshd_config" "$CHROOT$GUEST_SSHD_CONF" 2>/dev/null || :; } | cksum
+}
+
+# A running sshd keeps the config it started with, so new guest rules would
+# only apply after a reboot. SIGHUP makes it re-read the config; open
+# sessions stay up. Only our own sshd (the PID the autostart recorded, rooted
+# in this chroot) is signalled.
+reload_running_sshd() {
+    [[ "$DEV" != 1 ]] || return 0
+    local pidfile="$STATE_DIR/run/sshd.pid" pid=""
+    [[ -f "$pidfile" ]] || return 0
+    read -r pid < "$pidfile" || return 0
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    [[ "$(readlink "/proc/$pid/root" 2>/dev/null)" == "$CHROOT" ]] || return 0
+    chroot_run /usr/sbin/sshd -t || die "Invalid sshd configuration; the running sshd was left as it was"
+    kill -HUP "$pid" || { warn "Could not reload sshd; reboot the phone to apply the guest rules"; return 0; }
+    info "sshd reloaded with the guest rules"
+}
+
 write_sshd_autostart() {
     [[ "$ENABLE_SSH" == "1" ]] || return 0
 
@@ -783,7 +872,7 @@ while true; do
     chroot "\$CHROOT" /usr/bin/env -i \\
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\
         HOME=/root TMPDIR=/tmp /usr/bin/sh -c \\
-        'mkdir -p /run/sshd && chmod 0755 /run/sshd && /usr/sbin/sshd -t && exec /usr/sbin/sshd -D -e' \\
+        'mkdir -p /run/sshd && chmod 0755 /run/sshd && if [ -x /usr/local/sbin/serverinator-guests ]; then /usr/local/sbin/serverinator-guests mount-all || :; fi; /usr/sbin/sshd -t && exec /usr/sbin/sshd -D -e' \\
         >> "\$LOG" 2>&1 &
     child=\$!
     printf '%s\\n' "\$child" > "\$STATE_DIR/run/sshd.pid"
@@ -1661,6 +1750,7 @@ main() {
     install_wstunnel
     generate_wg_keys
     install_ssh_server
+    install_guest_support
     # wstunnel autostart is written later (apply_back_handoff) — needs the VPS IP
     prepare_sshd_runtime "${SSHD_LISTEN_IP:-}"
     write_sshd_autostart
