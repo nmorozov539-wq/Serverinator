@@ -27,7 +27,8 @@ your laptop ──SSH (ProxyJump)──▶ VPS ──WireGuard──▶ phone: s
 - **OpenSSH** inside the chroot listens on port 2222 of the phone's tunnel
   address only, never on its Wi-Fi or mobile interface.
 - **Magisk `service.d` scripts** start everything at every boot and
-  restart anything that crashes.
+  restart anything that crashes. When the phone moves between mobile data
+  and Wi-Fi, the tunnel reconnects on the new network.
 
 ## Requirements
 
@@ -82,19 +83,20 @@ Your laptop (or any client) only needs an OpenSSH client.
    config, and finishes with a test connection.
 
 4. **Reboot the phone.** The install only writes the autostart scripts;
-   Magisk runs them at boot. Allow a minute or two for the tunnel to come
-   up.
+   Magisk runs them at boot, along with the `si` command (see below).
+   The tunnel usually comes up within seconds of the network.
 
-5. **Check the tunnel** from any machine that can SSH to the VPS:
+5. **Check the tunnel.** On the phone, as root:
 
    ```
-   ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --verify --device PHONE'
+   si status    # this phone's side: supervisors, handshake, a ping to the VPS
+   si verify    # end to end, run on the VPS
    ```
 
-   It checks the WireGuard interface and handshake, the wstunnel service,
-   a ping, and real SSH data through the tunnel. The last check matters
-   because some networks let the handshake through but silently drop
-   the data.
+   `si verify` checks the WireGuard interface and handshake, the wstunnel
+   service, a ping, and real SSH data through the tunnel. The last check
+   matters because some networks let the handshake through but silently
+   drop the data. On the VPS the same check is `si verify --device PHONE`.
 
 6. **Set up your laptop and connect.** The VPS has a ready-made setup
    script for you. It installs a key and an SSH config entry with the
@@ -114,15 +116,39 @@ Your laptop (or any client) only needs an OpenSSH client.
    ```
 
 The commands above and below assume you log in to the VPS as root. With a
-sudo user, prefix the VPS command with `sudo` and fetch files with
-`ssh your-vps 'sudo cat FILE' > FILE` instead of `scp`. At the end of the
-install the installer prints the exact commands for your setup, so you
-can copy them from there.
+sudo user, fetch files with `ssh your-vps 'sudo cat FILE' > FILE` instead
+of `scp`; `si` on the VPS uses sudo by itself. At the end of the install
+the installer prints the exact commands for your setup, so you can copy
+them from there.
+
+## The si command
+
+The installer sets up `si`, one short command for everyday tasks, in three
+places. It's there before the rest of the install starts, so it also works
+when a later step fails. `si help` lists what works where.
+
+| Where | How you get there | What it does |
+|---|---|---|
+| Phone (Android side) | `su` in Termux, or `adb shell su` | everything: `si status`, `si logs`, `si setup`, `si set-domain`, `si export-identity`, `si uninstall`, plus the VPS commands below, which it runs on the VPS for you |
+| Phone (inside the chroot) | `ssh PHONE-ALIAS` | `si status` |
+| VPS | any root or sudo login | `si verify`, `si devices`, `si add-client`, guests, `si uninstall` |
+
+On the phone `si` appears after the first reboot (a small Magisk module
+puts it in `/system/bin`), and needs root: `su -c 'si status'`. It uses a
+copy of the scripts in `/data/adb/serverinator/bin`, so the folder you ran
+the installer from can go. The phone remembers its VPS and its name, so
+`si setup` re-runs the installer without asking for them again, and
+`si add-client LABEL` on the phone adds the client for this phone.
+
+`si logs [NAME] [-n LINES]` shows the last lines of the tunnel's logs
+(wstunnel, wireguard, sshd). Every `si` command is a shortcut: the long
+flags of `serverinator.sh`, `core-phone.sh` and `core-vps.sh` work as
+before, and `si vps --any-flag` passes a flag straight to `core-vps.sh`.
 
 ## Managing access
 
-All of these run on the VPS. `core-vps.sh` stands for
-`/root/.serverinator/bin/core-vps.sh`.
+These run on the VPS as written, or on the phone with the same `si`
+command (it fills in `--device` for this phone).
 
 ### People and devices with full access (clients)
 
@@ -130,9 +156,9 @@ Each client gets its own key, which you can revoke on its own. A client
 has the same root access to the phone as you do.
 
 ```
-core-vps.sh --add-client LABEL       # writes client-setup-LABEL-PHONE.sh and .ps1
-core-vps.sh --revoke-client LABEL
-core-vps.sh --list-clients
+si add-client LABEL       # writes client-setup-LABEL-PHONE.sh and .ps1
+si revoke-client LABEL
+si clients
 ```
 
 Hand the generated setup script to that person, and they run it as in
@@ -147,17 +173,17 @@ an Android SFTP client) to the VPS's normal SSH port as user
 phone, so no new port is opened.
 
 ```
-core-vps.sh --add-guest anna                        # asks for folders
-core-vps.sh --add-guest anna --folder photos        # /srv/files/photos on the phone
-core-vps.sh --add-guest anna --folder /root/music:ro
-core-vps.sh --add-guest anna --pubkey anna.pub          # use the guest's own ed25519 key
-core-vps.sh --guest-access anna --folder photos     # replaces anna's folder list
-core-vps.sh --revoke-guest anna                     # her files stay on the phone
-core-vps.sh --list-guests                           # includes folder sizes
-core-vps.sh --sync-guests                           # re-create guests after a phone reset
+si add-guest anna                        # asks for folders (on the VPS)
+si add-guest anna --folder photos        # /srv/files/photos on the phone
+si add-guest anna --folder /root/music:ro
+si add-guest anna --pubkey anna.pub      # use the guest's own ed25519 key
+si guest-access anna --folder photos     # replaces anna's folder list
+si revoke-guest anna                     # her files stay on the phone
+si guests                                # includes folder sizes
+si sync-guests                           # re-create guests after a phone reset
 ```
 
-`--add-guest` prints what to type into the app and where the guest's key
+`si add-guest` prints what to type into the app and where the guest's key
 file is. Fetch that key with your own admin login: a client key can only
 jump through to the phone, not read files on the VPS.
 
@@ -165,11 +191,12 @@ jump through to the phone, not read files on the VPS.
 
 Run the installer on each phone with a different name. Each phone gets
 its own tunnel address, clients and guests. With more than one phone,
-add `--device PHONE` to the client, guest and `--verify` commands.
+add `--device PHONE` to the client, guest and `verify` commands on the
+VPS (on a phone, `si` adds its own).
 
 ```
-core-vps.sh --list-devices
-core-vps.sh --remove-device PHONE
+si devices
+si remove-device PHONE
 ```
 
 ## Domain and a real certificate
@@ -188,13 +215,13 @@ stopped for the few seconds of each check and started again.
 To switch an existing phone to a domain, or back, run on the phone:
 
 ```
-bash serverinator.sh --vps root@VPS --set-domain vps.example.com
-bash serverinator.sh --vps root@VPS --remove-domain
+si set-domain vps.example.com [--acme-email you@example.com]
+si remove-domain
 ```
 
 Other phones on the same VPS keep working by IP until you run the same
 command on each. To use a certificate you already have, run this on the
-VPS: `core-vps.sh --set-domain DOMAIN --tls-cert /abs/fullchain.pem --tls-key /abs/privkey.pem`.
+VPS: `si --set-domain DOMAIN --tls-cert /abs/fullchain.pem --tls-key /abs/privkey.pem`.
 
 ## Moving to a new phone
 
@@ -204,28 +231,33 @@ run the installer there with the same VPS and phone name. The VPS and
 all clients keep working without changes.
 
 ```
-bash core/core-phone.sh --export-identity /sdcard/si-identity.tar   # old phone
-bash core/core-phone.sh --import-identity /sdcard/si-identity.tar   # new phone
+si export-identity /sdcard/si-identity.tar                          # old phone
+bash core/core-phone.sh --import-identity /sdcard/si-identity.tar   # new phone, before the installer
 ```
 
 The file contains private keys, so treat it like a password.
 
 ## Uninstall
 
-On the phone, this removes the chroot and the autostart scripts. The
-phone's WireGuard and SSH host keys are kept so a reinstall keeps the same
-identity; `--purge` deletes them too.
+On the phone, this removes the chroot, the autostart scripts and the `si`
+command. The phone's WireGuard and SSH host keys are kept so a reinstall
+keeps the same identity; `--purge` deletes them too.
 
 ```
-bash core/core-phone.sh --uninstall [--purge]
+si uninstall [--purge]
 ```
 
-On the VPS, this removes ServerInator's services, config and firewall
-rules and leaves everything else alone:
+On the VPS, this removes ServerInator's services, config, client keys,
+firewall rules and `si`, and leaves everything else alone:
 
 ```
-ssh your-vps 'bash /root/.serverinator/bin/core-vps.sh --uninstall'
+ssh your-vps si uninstall
 ```
+
+A VPS uninstall forgets the domain and the client keys. After installing
+again, run `si set-domain DOMAIN` on the phone if you used one, and give
+each client the new setup script (move its old `~/.ssh/si-ALIAS` key
+aside first: the script keeps a key that already exists).
 
 ## Security model
 
@@ -286,6 +318,7 @@ core/core-phone.sh     phone side: chroot, keys, sshd, Magisk scripts
 core/core-vps.sh       VPS side: WireGuard, wstunnel, clients, guests, domains
 core/vps-auth.sh       getting the phone's key onto the VPS
 core/guest-helper.sh   guest accounts and folders inside the chroot
+core/si                the si command (phone, chroot and VPS)
 core/lib.sh, motd.bash shared helpers and the login banner
 tests/                 local test suite
 tools/                 diagnostics
@@ -297,8 +330,8 @@ tools/                 diagnostics
   phone and a guest gets files only. A normal shell user without root
   doesn't exist yet.
 - **No alert when the tunnel goes down.** You find out by trying to
-  connect. A watchdog that sends a notification on a missed handshake
-  would fix this.
+  connect, or with `si status`. A watchdog that sends a notification on a
+  missed handshake would fix this.
 - **Moving to a new VPS isn't a tested workflow.** Re-running the
   installer against a new VPS should work, since the phone's keys don't
   depend on the VPS, but it hasn't been tested end to end. With a
