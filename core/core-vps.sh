@@ -507,6 +507,8 @@ install_wstunnel_vps() (
         current="$("$WSTUNNEL_BIN" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
         if [[ "$current" == "$WSTUNNEL_VERSION" ]]; then
             info "wstunnel v${WSTUNNEL_VERSION} already installed — skipping"
+            # Older installs kept the archive's owner; see below.
+            [[ "$(id -u)" != 0 ]] || chown 0:0 "$WSTUNNEL_BIN"
             return 0
         fi
         warn "wstunnel v${current:-?} is installed, v${WSTUNNEL_VERSION} is required — upgrading"
@@ -540,7 +542,10 @@ STUB
     tar -xf "$scratch/wstunnel.tar.gz" -C "$scratch" wstunnel
     mkdir -p "$(dirname "$WSTUNNEL_BIN")"
     mv "$scratch/wstunnel" "$WSTUNNEL_BIN"
-    chmod +x "$WSTUNNEL_BIN"
+    # tar keeps the archive's owner (uid 1001) when run as root; a user who
+    # later gets that uid could swap the binary root runs.
+    [[ "$(id -u)" != 0 ]] || chown 0:0 "$WSTUNNEL_BIN"
+    chmod 755 "$WSTUNNEL_BIN"
     mkdir -p "$WG_KEY_DIR"
     touch "$WG_KEY_DIR/wstunnel-owned"
     info "wstunnel installed: $WSTUNNEL_BIN"
@@ -2432,6 +2437,8 @@ remove_device() {
         rm -f "${f%.pub}" "$f"
     done < <( { [[ -f "$SSH_KEY_DIR/owner_${name}.pub" ]] && echo "$SSH_KEY_DIR/owner_${name}.pub"; device_client_pubs "$name"; } )
     rm -f "$SSH_KEY_DIR/client-setup-owner-${name}".{sh,ps1} "$SSH_KEY_DIR"/client-setup-*-"${name}".{sh,ps1}
+    # Its pinned host key too: a new phone with this name has another one.
+    rm -f "$(phone_known_hosts_file "$name")"
     rm -f "$record"
     remove_device_guests "$name"
     info "Phone '$name' removed from this VPS."
@@ -2503,9 +2510,17 @@ uninstall_vps() {
     local bin_dir
     bin_dir="$(cd "$CORE_DIR" && pwd -P)"
     if [[ "$DEV" != 1 && "$bin_dir" == /root/.serverinator/bin ]]; then
-        rm -f "$bin_dir"/core-vps.sh "$bin_dir"/lib.sh
+        rm -f "$bin_dir"/core-vps.sh "$bin_dir"/lib.sh "$bin_dir"/si
         rmdir "$bin_dir" /root/.serverinator 2>/dev/null || true
         info "Removed the scripts in $bin_dir"
+    fi
+    # The si launcher, only if it's ours.
+    local si_launcher="${SERVERINATOR_SI_LAUNCHER:-/usr/local/bin/si}"
+    [[ "$DEV" != 1 || -n "${SERVERINATOR_SI_LAUNCHER:-}" ]] || si_launcher=""
+    if [[ -n "$si_launcher" && -f "$si_launcher" ]] \
+            && grep -q '^# ServerInator: the si command (managed)' "$si_launcher"; then
+        rm -f "$si_launcher"
+        info "Removed the si command ($si_launcher)"
     fi
     info "VPS uninstalled. Foreign interfaces and firewall rules were preserved."
 }

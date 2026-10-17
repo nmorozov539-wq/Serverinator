@@ -78,6 +78,10 @@ elapsed() {
 # ── Utilities ──────────────────────────────────
 
 have_cmd()    { command -v "$1" &>/dev/null; }
+
+# For `read ... || no_answer QUESTION [HINT]`: the input ended (no terminal,
+# or a pipe that ran out) before the answer. Without it, set -e quits silently.
+no_answer() { die "No answer to \"$1\": the input ended. ${2:-Run it in a terminal.}"; }
 require_cmd() { have_cmd "$1" || die "Command not found: $1"; }
 
 # ── File management ────────────────────────────
@@ -350,4 +354,42 @@ safe_remove_path() {
             die "Rejected overly broad path for removal: '$path'"
             ;;
     esac
+}
+
+# ── Magisk launchers (phone) ──────────────────
+
+# write_magisk_launcher MODULES_DIR BACKUP_DIR ID COMMAND NAME DESCRIPTION "SCRIPT ARGS"
+# A minimal Magisk module whose only file is system/bin/COMMAND, a launcher
+# that runs SCRIPT with the first bash it finds. Magisk mounts it at boot.
+write_magisk_launcher() {
+    local modules="$1" backups="$2" id="$3" cmd="$4" name="$5" desc="$6" target="$7"
+    local dir="$modules/$id"
+    mkdir -p "$dir/system/bin"
+    # Backups go elsewhere: a .bak in system/bin would be mounted too.
+    reconcile_file "$dir/module.prop" 644 "$backups" << EOF
+id=$id
+name=$name
+version=1
+versionCode=1
+author=ServerInator
+description=$desc
+EOF
+    reconcile_file "$dir/system/bin/$cmd" 755 "$backups" << EOF
+#!/system/bin/sh
+# ServerInator: the $cmd command (managed).
+[ "\$(id -u)" = 0 ] || { echo "$cmd: run it as root: su -c '$cmd \$*'" >&2; exit 1; }
+for b in /system_ext/bin/bash /system/bin/bash /data/data/com.termux/files/usr/bin/bash; do
+    [ -x "\$b" ] && exec "\$b" $target "\$@"
+done
+echo "$cmd: no bash found" >&2
+exit 1
+EOF
+    local changed="$RECONCILED_CHANGED"
+    rm -f "$dir/remove" "$dir/disable"
+    # -f, not -x: on Android bash's access() check can say no to root.
+    if [[ -f "/system/bin/$cmd" ]]; then
+        [[ "$changed" == 0 ]] || info "The $cmd launcher changed; the new one is used after the next reboot"
+    else
+        info "The $cmd command appears after the next reboot. Until then: sh $dir/system/bin/$cmd help"
+    fi
 }

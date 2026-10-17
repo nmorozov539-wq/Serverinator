@@ -68,6 +68,13 @@ IDENTITY_DIR="${SERVERINATOR_IDENTITY_DIR:-$STATE_DIR/identity}"
 # serverinator.sh's key for logging into the VPS (same default as there).
 ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-/data/adb/serverinator/orchestrator}"
 IDENTITY_FILE=""
+# Magisk modules: serverinator.sh's `si` command lives in one. DEV never
+# touches the real folder.
+if [[ "$DEV" == "1" ]]; then
+    MAGISK_MODULES_DIR="${SERVERINATOR_MODULES_DIR:-}"
+else
+    MAGISK_MODULES_DIR="${SERVERINATOR_MODULES_DIR:-/data/adb/modules}"
+fi
 
 # ── Shared library ────────────────────────────
 # Resolved once at the top level: inside a function, the phone's bash gave
@@ -91,6 +98,7 @@ parse_args() {
                 BACK_HANDOFF_FILE="$1"; shift
                 ;;
             --uninstall) MODE="uninstall"; shift ;;
+            --status)    MODE="status"; shift ;;
             --export-identity|--import-identity)
                 [[ "$1" == --export-identity ]] && MODE="export-identity" || MODE="import-identity"
                 shift
@@ -474,12 +482,16 @@ STUB
     fi
 
     # Check both presence AND version — a mismatched version gets upgraded.
-    if [[ -x "$dest" ]]; then
+    # -f, not -x: Android's bash can deny root an access() check, which made
+    # every run download wstunnel again (seen 2026-10-17).
+    if [[ -f "$dest" ]]; then
         local current
         current="$(chroot_run /usr/local/bin/wstunnel --version 2>&1 \
             | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
         if [[ "$current" == "$WSTUNNEL_VERSION" ]]; then
             info "wstunnel v${WSTUNNEL_VERSION} already installed — skipping"
+            # Older installs kept the archive's owner; see below.
+            [[ "$(id -u)" != 0 ]] || chown 0:0 "$dest"
             return 0
         fi
         warn "wstunnel v${current:-?} is installed, v${WSTUNNEL_VERSION} is required — upgrading"
@@ -502,7 +514,9 @@ STUB
     tar -xf "$scratch/wstunnel.tar.gz" -C "$scratch" wstunnel
     mkdir -p "$CHROOT/usr/local/bin"
     mv "$scratch/wstunnel" "$dest"
-    chmod +x "$dest"
+    # tar keeps the archive's owner (uid 1001) when run as root.
+    [[ "$(id -u)" != 0 ]] || chown 0:0 "$dest"
+    chmod 755 "$dest"
     rm -f "$scratch/wstunnel.tar.gz"
     info "wstunnel installed to $dest"
 )
@@ -945,6 +959,15 @@ cleanup() {
     rm -f "\$STATE_DIR/run/wstunnel.pid" "\$STATE_DIR/run/wstunnel-supervisor.pid"
 }
 trap 'cleanup; exit' INT TERM
+# The interface the VPS is reached through (wlan0, rmnet_data1, ...), or
+# nothing while there is no usable network.
+route_dev() {
+    route=\$(ip route get ${probe_ip} 2>/dev/null) || route=''
+    case "\$route" in
+        ''|*' dev lo'*|*' dev dummy'*|*unreachable*|*prohibit*) return 0 ;;
+    esac
+    printf '%s\\n' "\$route" | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n 1
+}
 # Wait until the VPS is routable (network is up), up to 120s. Android keeps
 # its default route in per-network tables, not main, so "ip route show
 # default" stays empty and used to burn the full 120s on every boot.
@@ -968,7 +991,22 @@ ${verify_line}        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VPS_PORT}?timeou
         >> "\$LOG" 2>&1 &
     child=\$!
     printf '%s\\n' "\$child" > "\$STATE_DIR/run/wstunnel.pid"
-    while kill -0 "\$child" 2>/dev/null; do rotate_log || exit 1; sleep 5; done
+    # wstunnel keeps its connection on the network it started on. When the
+    # phone moves (mobile data at boot, then Wi-Fi), reconnect on the new
+    # one: a network that blocks the tunnel would otherwise hold it forever.
+    dev=\$(route_dev)
+    while kill -0 "\$child" 2>/dev/null; do
+        rotate_log || exit 1
+        sleep 5
+        now=\$(route_dev)
+        [ -n "\$now" ] || continue
+        if [ -z "\$dev" ]; then dev="\$now"; continue; fi
+        if [ "\$now" != "\$dev" ]; then
+            printf '%s\\n' "network changed (\$dev -> \$now), reconnecting" >> "\$LOG"
+            kill "\$child" 2>/dev/null
+            break
+        fi
+    done
     wait "\$child" 2>/dev/null || printf '%s\\n' 'wstunnel exited unsuccessfully' >> "\$LOG"
     child=''
     rm -f "\$STATE_DIR/run/wstunnel.pid"
@@ -999,6 +1037,22 @@ if [ -n "\${BASH_VERSION:-}" ]; then
         *i*) . /usr/local/lib/serverinator/motd.bash && __si_motd '${DEVICE_NAME}'; unset -f __si_motd ;;
     esac
 fi
+EOF
+}
+
+# `si` inside the chroot (core/si with "chroot"), for `ssh ALIAS 'si status'`.
+write_chroot_si() {
+    local f
+    for f in si lib.sh; do
+        [[ -f "$CORE_DIR/$f" ]] || die "Missing $CORE_DIR/$f next to core-phone.sh"
+    done
+    mkdir -p "$CHROOT/usr/local/lib/serverinator" "$CHROOT/usr/local/bin"
+    reconcile_file "$CHROOT/usr/local/lib/serverinator/si" 644 "$STATE_DIR/backups" < "$CORE_DIR/si"
+    reconcile_file "$CHROOT/usr/local/lib/serverinator/lib.sh" 644 "$STATE_DIR/backups" < "$CORE_DIR/lib.sh"
+    reconcile_file "$CHROOT/usr/local/bin/si" 755 "$STATE_DIR/backups" << 'EOF'
+#!/bin/sh
+# ServerInator: the si command (managed).
+exec bash /usr/local/lib/serverinator/si chroot "$@"
 EOF
 }
 
@@ -1489,11 +1543,84 @@ uninstall_phone() {
         rm -f "$MAGISK_SERVICE_D/$name.sh" "$MAGISK_SERVICE_D/$name.sh.bak"
     done
     rm -rf "$CHROOT"
-    if [[ "$PURGE" == 1 ]]; then rm -rf "$SSH_HOSTKEY_DIR" "$IDENTITY_DIR"; fi
+    if [[ "$PURGE" == 1 ]]; then rm -rf "$SSH_HOSTKEY_DIR" "$IDENTITY_DIR" "$STATE_DIR/vps-target"; fi
+    # The si command and the scripts it runs (serverinator.sh keeps them in
+    # STATE_DIR/bin), plus any module built on top of Core (serverinator-*).
+    # Bash keeps this file open, so removing it doesn't stop the run.
+    local module
+    if [[ -n "$MAGISK_MODULES_DIR" ]]; then
+        for module in "$MAGISK_MODULES_DIR/serverinator" "$MAGISK_MODULES_DIR"/serverinator-*; do
+            [[ -d "$module" ]] && rm -rf "$module"
+        done
+    fi
+    rm -rf "$STATE_DIR/bin"
     # Logs and .bak backups are pure operational debris, not identity state —
     # always clear them, regardless of --purge.
     rm -rf "$STATE_DIR/run" "$STATE_DIR/logs" "$STATE_DIR/backups"
     info "Phone uninstall complete; WireGuard and SSH host keys kept unless --purge"
+}
+
+# ── Status (si status) ────────────────────────
+
+# One look at everything the tunnel needs, for debugging without the VPS:
+# supervisors, the wstunnel and sshd processes, the WireGuard handshake and a
+# ping to the VPS through the tunnel. Exits 1 if anything is wrong.
+status_pid_alive() { # PIDFILE
+    local pid=""
+    [[ -f "$1" ]] && read -r pid < "$1"
+    [[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]]
+}
+
+phone_status() {
+    check_root
+    local conf="$CHROOT/etc/wireguard/wg-si.conf" bad=0 name hs age vps_ip
+    if [[ ! -f "$conf" ]]; then
+        fail "Core is not installed on this phone ($conf is missing)"
+        return 1
+    fi
+    for name in wstunnel wireguard sshd; do
+        if status_pid_alive "$STATE_DIR/run/$name-supervisor.pid"; then
+            ok "$name supervisor is running"
+        else
+            fail "$name supervisor is not running"; bad=1
+        fi
+    done
+    for name in wstunnel sshd; do
+        if status_pid_alive "$STATE_DIR/run/$name.pid"; then
+            ok "$name is running"
+        else
+            fail "$name is not running"; bad=1
+        fi
+    done
+    if chroot_run ip link show wg-si >/dev/null 2>&1; then
+        ok "wg-si is up"
+        hs="$(chroot_run wg show wg-si latest-handshakes 2>/dev/null | awk '{print $2; exit}')" || hs=""
+        if [[ "$hs" =~ ^[0-9]+$ && "$hs" -gt 0 ]]; then
+            age=$(( $(date +%s) - hs ))
+            if (( age <= 180 )); then
+                ok "Last handshake with the VPS ${age}s ago"
+            else
+                fail "Last handshake with the VPS ${age}s ago (over 3 minutes)"; bad=1
+            fi
+        else
+            fail "No handshake with the VPS yet"; bad=1
+        fi
+    else
+        fail "wg-si is missing"; bad=1
+    fi
+    vps_ip="$(awk -F'[ =/]+' '$1=="AllowedIPs" {print $2; exit}' "$conf")"
+    if [[ -n "$vps_ip" ]] && chroot_run ping -c 1 -W 3 "$vps_ip" >/dev/null 2>&1; then
+        ok "VPS answers through the tunnel ($vps_ip)"
+    else
+        fail "No answer from the VPS through the tunnel (${vps_ip:-?})"; bad=1
+    fi
+    echo ""
+    if [[ "$bad" == 0 ]]; then
+        echo "  All good. Logs: si logs"
+    else
+        echo "  Something is wrong. Last lines of each log: si logs"
+    fi
+    return "$bad"
 }
 
 # ── Identity backup / restore ─────────────────
@@ -1713,6 +1840,7 @@ import_identity() {
 main() {
     parse_args "$@"
     if [[ "$MODE" == uninstall ]]; then uninstall_phone; return; fi
+    if [[ "$MODE" == status ]]; then phone_status; return; fi
     if [[ "$MODE" == export-identity ]]; then export_identity "$IDENTITY_FILE"; return; fi
     if [[ "$MODE" == import-identity ]]; then import_identity "$IDENTITY_FILE"; return; fi
     [[ "$PURGE" == 0 ]] || die "--purge requires --uninstall"
@@ -1755,6 +1883,7 @@ main() {
     prepare_sshd_runtime "${SSHD_LISTEN_IP:-}"
     write_sshd_autostart
     write_login_summary
+    write_chroot_si
 
     step 4/4 "Generating handoff"
     generate_handoff

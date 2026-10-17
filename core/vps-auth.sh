@@ -131,7 +131,7 @@ auth_route_existing_keys() {
     echo ""
     echo "  Found key(s) on this phone that may already have access to the VPS:"
     for k in "${keys[@]}"; do echo "    $k"; done
-    read -r -p "  Use them once to add this script's key? [Y/n] " answer
+    read -r -p "  Use them once to add this script's key? [Y/n] " answer || [[ -n "$answer" ]] || no_answer "Use them once"
     [[ "${answer:-Y}" =~ ^[Yy]$ ]] || return 1
     for k in "${keys[@]}"; do opts+=(-i "$k"); done
     # One connection offers every candidate. BatchMode stays off so a
@@ -286,7 +286,8 @@ _auth_wait_and_check() {
     local answer
     while :; do
         _auth_require_budget
-        read -r -p "  Press Enter once it has run (or type q to choose another way): " answer
+        read -r -p "  Press Enter once it has run (or type q to choose another way): " answer \
+            || [[ -n "$answer" ]] || no_answer "Press Enter once it has run"
         [[ "$answer" == q ]] && return 1
         if auth_try_own_key; then
             ok "The VPS now accepts this script's key"
@@ -323,7 +324,8 @@ auth_offer_root() {
     is_plain_pubkey "$pub" || die "Unexpected orchestrator public key format"
     echo ""
     info "${VPS_USER} needs a password for sudo, which this script never types for you."
-    read -r -p "  Let this script log in as root with its key from now on? (asks your sudo password once) [Y/n] " answer
+    read -r -p "  Let this script log in as root with its key from now on? (asks your sudo password once) [Y/n] " answer \
+        || [[ -n "$answer" ]] || no_answer "Log in as root from now on"
     if [[ ! "${answer:-Y}" =~ ^[Yy]$ ]]; then
         auth_offer_sudoers
         return
@@ -372,7 +374,7 @@ auth_offer_sudoers() {
     echo "  Alternative: give ${VPS_USER} passwordless sudo by creating ${file}:"
     echo "    ${VPS_USER} ALL=(ALL) NOPASSWD: ALL"
     echo "  This changes the server's security: whoever holds ${VPS_USER}'s SSH key gets root without a password."
-    read -r -p "  Create it? [y/N] " answer
+    read -r -p "  Create it? [y/N] " answer || [[ -n "$answer" ]] || no_answer "Create it"
     [[ "$answer" =~ ^[Yy]$ ]] || return 1
     cat > "$script" <<EOF
 t=\$(mktemp) || exit 1
@@ -425,7 +427,7 @@ authorize_vps() {
         local i=1 o
         for o in "${opts[@]}"; do echo "    $i) ${o#*:}"; i=$((i + 1)); done
         echo "    q) Quit"
-        read -r -p "  Choose: " choice
+        read -r -p "  Choose: " choice || [[ -n "$choice" ]] || no_answer "Choose" "This step needs a terminal. This script's key: $(_auth_pubkey)"
         [[ "$choice" == q ]] && die "Stopped. This script's key: $(_auth_pubkey)"
         [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#opts[@]})) || continue
         case "${opts[choice-1]%%:*}" in

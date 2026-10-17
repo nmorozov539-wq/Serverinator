@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────
+# ServerInator — `si`, short commands for everyday Core tasks.
+#
+# One script for three places. The launcher serverinator.sh writes passes
+# the place as the first argument:
+#   phone   Android side (a Magisk module puts `si` in /system/bin)
+#   chroot  inside the phone's Debian, where `ssh ALIAS` lands
+#   vps     on the VPS (/usr/local/bin/si)
+# `si help` lists what works there. The long flags of core-phone.sh,
+# core-vps.sh and serverinator.sh keep working; si only saves typing.
+# ─────────────────────────────────────────────
+
+WHERE="${1:-}"
+[[ $# -gt 0 ]] && shift
+SI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SI_DIR/lib.sh"
+
+STATE_DIR="${SERVERINATOR_STATE_DIR:-/data/adb/serverinator}"
+ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-$STATE_DIR/orchestrator}"
+CHROOT="${SERVERINATOR_CHROOT:-/data/serverinator-root}"
+VPS_SI="${SERVERINATOR_VPS_SI:-/usr/local/bin/si}"   # the VPS's launcher
+
+# Commands that run core-vps.sh on the VPS, and the flag each one becomes.
+# The phone forwards them over SSH; ones marked with * get this phone's
+# --device added unless one is given.
+vps_flag() { # COMMAND -> FLAG (empty if not a VPS command)
+    case "$1" in
+        verify)        echo "--verify*" ;;
+        clients)       echo "--list-clients*" ;;
+        add-client)    echo "--add-client*" ;;
+        revoke-client) echo "--revoke-client*" ;;
+        guests)        echo "--list-guests*" ;;
+        add-guest)     echo "--add-guest*" ;;
+        guest-access)  echo "--guest-access*" ;;
+        revoke-guest)  echo "--revoke-guest*" ;;
+        sync-guests)   echo "--sync-guests*" ;;
+        devices)       echo "--list-devices" ;;
+        remove-device) echo "--remove-device" ;;
+    esac
+}
+
+usage() {
+    case "$WHERE" in
+        phone) cat <<'EOF'
+si — ServerInator Core on this phone
+
+  si status                     is the tunnel up? (supervisors, handshake, ping)
+  si logs [NAME] [-n LINES]     last log lines (wstunnel, wireguard, sshd, ...)
+  si setup [OPTIONS]            re-run serverinator.sh against the saved VPS
+  si set-domain DOMAIN [--acme-email EMAIL]
+  si remove-domain              back to the VPS's IP and self-signed certificate
+  si export-identity FILE       keys and name, to move to another phone
+  si import-identity FILE       on the new phone, before si setup
+  si uninstall [--purge]        remove Core from this phone
+
+On the VPS, through SSH (this phone's device is filled in):
+  si verify | si clients | si add-client LABEL | si revoke-client LABEL
+  si guests | si add-guest NAME [--folder F]... | si guest-access NAME --folder F...
+  si revoke-guest NAME | si sync-guests | si devices | si remove-device NAME
+  si vps ARGS...                anything else core-vps.sh takes
+EOF
+            ;;
+        chroot) cat <<'EOF'
+si — ServerInator Core, inside the phone's Debian
+
+  si status       is the tunnel up? (handshake, wstunnel, sshd, ping)
+
+Everything else runs on the Android side (adb or Termux, as root): si help.
+EOF
+            ;;
+        vps) cat <<'EOF'
+si — ServerInator Core on the VPS (runs core-vps.sh)
+
+  si verify [--device NAME]     check a phone's tunnel end to end
+  si devices                    every phone on this VPS
+  si clients                    who can SSH to the phone
+  si add-client LABEL           new client key and setup scripts
+  si revoke-client LABEL
+  si guests                     files-only guests
+  si add-guest NAME [--folder NAME|PATH[:ro|:rw]]... [--pubkey KEY|FILE]
+  si guest-access NAME --folder ...   replace a guest's folders
+  si revoke-guest NAME
+  si sync-guests                after a phone reset
+  si remove-device NAME
+  si uninstall                  remove Core from this VPS
+
+With several phones, add --device NAME. Any core-vps.sh flag works too,
+like si --set-domain DOMAIN.
+EOF
+            ;;
+        *) echo "si: run through its launcher (si help)" ;;
+    esac
+}
+
+# ── Phone ─────────────────────────────────────
+
+saved() { # FILE -> first line, or empty
+    [[ -s "$1" ]] && head -n 1 "$1" || true
+}
+
+phone_vps_target() {
+    local target
+    target="$(saved "$STATE_DIR/vps-target")"
+    [[ -n "$target" ]] || die "This phone doesn't know its VPS yet. Run: si setup --vps user@host"
+    printf '%s\n' "$target"
+}
+
+# Runs the VPS's si with ARGS over serverinator.sh's SSH key.
+on_vps() {
+    local target key cmd="" a
+    target="$(phone_vps_target)"
+    key="$ORCHESTRATOR_SSH_DIR/id_ed25519"
+    [[ -f "$key" ]] || die "No SSH key for the VPS at $key. Run: si setup"
+    for a in "$@"; do cmd+=" $(printf '%q' "$a")"; done
+    exec ssh -o BatchMode=yes -o "IdentityFile=$key" -o IdentitiesOnly=yes \
+        -o "UserKnownHostsFile=$ORCHESTRATOR_SSH_DIR/known_hosts" -o ConnectTimeout=30 \
+        "$target" "$VPS_SI$cmd"
+}
+
+phone_logs() {
+    local name="" lines=20 f found=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) shift; [[ "${1:-}" =~ ^[0-9]+$ ]] || die "-n needs a number"; lines="$1"; shift ;;
+            -*) die "Unknown option: $1" ;;
+            *)  [[ "$1" =~ ^[a-z0-9-]+$ ]] || die "Odd log name: $1"; name="$1"; shift ;;
+        esac
+    done
+    for f in "$STATE_DIR"/logs/*.log; do
+        [[ -f "$f" ]] || continue
+        if [[ -n "$name" ]]; then
+            case "${f##*/}" in "$name.log"|*"-$name.log") ;; *) continue ;; esac
+        fi
+        found=1
+        echo "${C_BOLD}── ${f##*/}${C_RESET}"
+        # wstunnel colours its own output; strip that so it reads in any
+        # terminal. Android's sed has no \x escapes, so pass a real ESC.
+        tail -n "$lines" "$f" | sed "s/$(printf '\033')\[[0-9;]*m//g"
+    done
+    [[ "$found" == 1 ]] || die "No log${name:+ named $name} in $STATE_DIR/logs"
+}
+
+run_phone() {
+    local cmd="${1:-help}" flag
+    [[ $# -gt 0 ]] && shift
+    case "$cmd" in
+        help|-h|--help) usage; return 0 ;;
+    esac
+    [[ "$(id -u)" == 0 ]] || die "Run as root (su)"
+    case "$cmd" in
+        status)          exec bash "$SI_DIR/core-phone.sh" --status "$@" ;;
+        logs)            phone_logs "$@" ;;
+        export-identity|import-identity)
+            [[ $# -eq 1 ]] || die "Use: si $cmd FILE"
+            exec bash "$SI_DIR/core-phone.sh" "--$cmd" "$1" ;;
+        uninstall)       exec bash "$SI_DIR/core-phone.sh" --uninstall "$@" ;;
+        setup|set-domain|remove-domain)
+            local args=() target
+            case "$cmd" in
+                set-domain)    [[ $# -gt 0 ]] || die "Use: si set-domain DOMAIN [--acme-email EMAIL]"
+                               args=(--set-domain "$1"); shift ;;
+                remove-domain) args=(--remove-domain) ;;
+            esac
+            if [[ " $* " != *" --vps "* && " $* " != *" --authorize-vps "* ]]; then
+                target="$(saved "$STATE_DIR/vps-target")"
+                if [[ -n "$target" ]]; then
+                    args=(--vps "$target" "${args[@]}")
+                elif [[ "$cmd" != setup ]]; then
+                    die "This phone doesn't know its VPS yet. Add --vps user@host"
+                fi
+            fi
+            exec bash "$SI_DIR/../serverinator.sh" "${args[@]}" "$@" ;;
+        vps)             [[ $# -gt 0 ]] || die "Use: si vps ARGS..."; on_vps "$@" ;;
+        *)
+            flag="$(vps_flag "$cmd")"
+            [[ -n "$flag" ]] || die "Unknown command: $cmd (si help)"
+            if [[ "$flag" == *'*' && " $* " != *" --device "* ]]; then
+                local device
+                device="$(saved "$STATE_DIR/identity/device-name")"
+                [[ -z "$device" ]] || set -- "$@" --device "$device"
+            fi
+            on_vps "$cmd" "$@" ;;
+    esac
+}
+
+# ── Chroot ────────────────────────────────────
+
+# True if a process with exactly this name runs (no procps in the chroot).
+proc_running() {
+    local c
+    for c in /proc/[0-9]*/comm; do
+        [[ "$(cat "$c" 2>/dev/null)" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+chroot_status() {
+    local bad=0 now hs age vps_ip conf=/etc/wireguard/wg-si.conf
+    [[ -f "$conf" ]] || die "No tunnel config ($conf). Is Core installed?"
+    if ip link show wg-si >/dev/null 2>&1; then ok "wg-si is up"; else fail "wg-si is missing"; bad=1; fi
+    hs="$(wg show wg-si latest-handshakes 2>/dev/null | awk '{print $2; exit}')" || hs=""
+    now="$(date +%s)"
+    if [[ "$hs" =~ ^[0-9]+$ && "$hs" -gt 0 ]]; then
+        age=$((now - hs))
+        if (( age <= 180 )); then ok "Last handshake ${age}s ago"; else fail "Last handshake ${age}s ago (over 3 minutes)"; bad=1; fi
+    else
+        fail "No handshake with the VPS yet"; bad=1
+    fi
+    if proc_running wstunnel; then ok "wstunnel is running"; else fail "wstunnel is not running"; bad=1; fi
+    if proc_running sshd; then ok "sshd is running"; else fail "sshd is not running"; bad=1; fi
+    vps_ip="$(awk -F'[ =/]+' '$1=="AllowedIPs" {print $2; exit}' "$conf")"
+    if [[ -n "$vps_ip" ]] && ping -c 1 -W 3 "$vps_ip" >/dev/null 2>&1; then
+        ok "VPS answers through the tunnel ($vps_ip)"
+    else
+        fail "No answer from the VPS through the tunnel (${vps_ip:-?})"; bad=1
+    fi
+    echo "  Logs are on the Android side: si logs"
+    return "$bad"
+}
+
+run_chroot() {
+    case "${1:-help}" in
+        help|-h|--help) usage ;;
+        status) chroot_status ;;
+        *) die "Unknown command: $1. Inside the chroot only 'si status' works; the rest runs on the Android side." ;;
+    esac
+}
+
+# ── VPS ───────────────────────────────────────
+
+run_vps() {
+    local cmd="${1:-help}" flag
+    [[ $# -gt 0 ]] && shift
+    case "$cmd" in
+        help|-h|--help) usage; return 0 ;;
+        uninstall) flag="--uninstall" ;;
+        -*) exec bash "$SI_DIR/core-vps.sh" "$cmd" "$@" ;;
+        *)
+            flag="$(vps_flag "$cmd")"
+            [[ -n "$flag" ]] || die "Unknown command: $cmd (si help)"
+            flag="${flag%\*}" ;;
+    esac
+    exec bash "$SI_DIR/core-vps.sh" "$flag" "$@"
+}
+
+case "$WHERE" in
+    phone)  run_phone "$@" ;;
+    chroot) run_chroot "$@" ;;
+    vps)    run_vps "$@" ;;
+    *) die "si: unknown place '$WHERE' (expected phone, chroot or vps)" ;;
+esac

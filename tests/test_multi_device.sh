@@ -64,6 +64,7 @@ assert_contains "$(cat "$tmp/amb.log")" "clashes with existing phone 'rn9p'" 'ex
 echo "Test: --remove-device removes one phone only"
 laptop_pub="$(cat "$key_dir/owner_rn9p_laptop.pub")"
 rn11p_owner="$(cat "$key_dir/owner_rn11p.pub")"
+echo 'pinned' > "$key_dir/known_hosts_rn9p"; echo 'pinned' > "$key_dir/known_hosts_rn11p"
 rc=0; vps --remove-device rn9p > "$tmp/rm.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'remove succeeds'
 assert_file_missing "$dev_dir/rn9p.json" 'record removed'
@@ -76,6 +77,8 @@ assert_contains "$(cat "$wg_conf")" '# ServerInator peer: rn11p' 'rn11p peer kep
 assert_not_contains "$(cat "$devroot/root/.ssh/authorized_keys")" "$laptop_pub" 'rn9p jump entries removed'
 assert_contains "$(cat "$devroot/root/.ssh/authorized_keys")" "$rn11p_owner" 'rn11p jump entry kept'
 assert_file_exists "$dev_dir/rn11p.json" 'rn11p record kept'
+assert_file_missing "$key_dir/known_hosts_rn9p" 'pinned host key removed'
+assert_file_exists "$key_dir/known_hosts_rn11p" 'other phone keeps its pinned host key'
 rc=0; vps --add-client tablet > /dev/null 2>&1 || rc=$?
 assert_eq 0 "$rc" 'with one phone left, --device is optional again'
 

@@ -33,6 +33,15 @@ ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-/data/adb/serverinato
 SSH_OPTS=()
 # Saved device name (see core-phone.sh IDENTITY_DIR).
 IDENTITY_DIR="${SERVERINATOR_IDENTITY_DIR:-/data/adb/serverinator/identity}"
+# The `si` command: a copy of these scripts in STATE_DIR/bin, and a Magisk
+# module that puts its launcher in /system/bin. DEV only with an explicit
+# modules folder.
+PHONE_STATE_DIR="${SERVERINATOR_STATE_DIR:-/data/adb/serverinator}"
+if [[ "$DEV" == "1" ]]; then
+    MAGISK_MODULES_DIR="${SERVERINATOR_MODULES_DIR:-}"
+else
+    MAGISK_MODULES_DIR="${SERVERINATOR_MODULES_DIR:-/data/adb/modules}"
+fi
 
 # ── Runtime state ─────────────────────────────
 VPS_TARGET=""       # user@host (final)
@@ -172,6 +181,51 @@ parse_args() {
 }
 
 # ─────────────────────────────────────────────
+# The si command (phone side)
+# ─────────────────────────────────────────────
+
+# Installs `si` before anything else, so it's there even when a later step
+# fails: copies serverinator.sh and core/ to STATE_DIR/bin (the tarball can
+# then go) and writes the Magisk module with the launcher. Magisk mounts it
+# at the next boot; the install ends with a reboot anyway.
+install_si_phone() {
+    [[ -n "$MAGISK_MODULES_DIR" ]] || return 0
+    local bin="$PHONE_STATE_DIR/bin" here stage f
+    mkdir -p "$bin"
+    chmod 700 "$PHONE_STATE_DIR" "$bin"
+    here="$(cd "$SCRIPT_DIR" && pwd -P)"
+    if [[ "$here" != "$(cd "$bin" && pwd -P)" ]]; then
+        # Staged and swapped in, never copied over a file bash may be reading.
+        stage="$(mktemp -d "$bin/.stage.XXXXXX")"
+        mkdir "$stage/core"
+        for f in core/core-phone.sh core/lib.sh core/vps-auth.sh core/core-vps.sh \
+                 core/guest-helper.sh core/motd.bash core/si; do
+            [[ -f "$SCRIPT_DIR/$f" ]] || die "Missing $SCRIPT_DIR/$f"
+            cp "$SCRIPT_DIR/$f" "$stage/$f"
+        done
+        cp "$SCRIPT_DIR/serverinator.sh" "$stage/serverinator.sh"
+        chmod -R go-rwx "$stage"
+        rm -rf "$bin/core.old"
+        [[ ! -d "$bin/core" ]] || mv "$bin/core" "$bin/core.old"
+        mv "$stage/core" "$bin/core"
+        mv -f "$stage/serverinator.sh" "$bin/serverinator.sh"
+        rm -rf "$bin/core.old" "$stage"
+    fi
+    write_magisk_launcher "$MAGISK_MODULES_DIR" "$PHONE_STATE_DIR/backups" \
+        serverinator si "ServerInator si command" \
+        "Adds the si command for ServerInator Core (si help)." \
+        "$bin/core/si phone"
+}
+
+# The VPS this phone uses, for si and add-ons built on Core (written once
+# login works).
+save_vps_target() {
+    [[ -n "$VPS_TARGET" && -d "$PHONE_STATE_DIR" ]] || return 0
+    printf '%s\n' "$VPS_TARGET" > "$PHONE_STATE_DIR/vps-target"
+    chmod 600 "$PHONE_STATE_DIR/vps-target"
+}
+
+# ─────────────────────────────────────────────
 # Questions for the user (all asked up front)
 # ─────────────────────────────────────────────
 
@@ -183,7 +237,8 @@ ask_questions() {
     echo ""
 
     if [[ -z "$VPS_TARGET" ]]; then
-        read -r -p "  VPS address (user@host or host): " VPS_TARGET
+        read -r -p "  VPS address (user@host or host): " VPS_TARGET \
+            || [[ -n "$VPS_TARGET" ]] || no_answer "VPS address" "Pass it as --vps user@host."
         echo ""
     fi
     [[ -n "$VPS_TARGET" ]] || die "VPS address cannot be empty"
@@ -195,10 +250,12 @@ ask_questions() {
         # Left by a previous install or by core-phone.sh --import-identity.
         [[ -s "$IDENTITY_DIR/device-name" ]] && saved="$(head -n 1 "$IDENTITY_DIR/device-name")"
         if [[ -n "$saved" ]]; then
-            read -r -p "  Name for this device [${saved}]: " DEVICE_NAME
+            read -r -p "  Name for this device [${saved}]: " DEVICE_NAME \
+                || [[ -n "$DEVICE_NAME" ]] || no_answer "Name for this device" "Pass it as --device-name $saved."
             DEVICE_NAME="${DEVICE_NAME:-$saved}"
         else
-            read -r -p "  Name for this device (e.g. rn9p): " DEVICE_NAME
+            read -r -p "  Name for this device (e.g. rn9p): " DEVICE_NAME \
+                || [[ -n "$DEVICE_NAME" ]] || no_answer "Name for this device" "Pass it as --device-name NAME."
         fi
         echo ""
     fi
@@ -206,7 +263,8 @@ ask_questions() {
     validate_device_name "$DEVICE_NAME"
 
     if [[ -z "$SSH_ALIAS" ]]; then
-        read -r -p "  SSH alias for connecting to the phone [${DEVICE_NAME}]: " SSH_ALIAS
+        read -r -p "  SSH alias for connecting to the phone [${DEVICE_NAME}]: " SSH_ALIAS \
+            || [[ -n "$SSH_ALIAS" ]] || no_answer "SSH alias" "Pass it as --alias $DEVICE_NAME."
         echo ""
         SSH_ALIAS="${SSH_ALIAS:-$DEVICE_NAME}"
     fi
@@ -232,13 +290,14 @@ ask_domain() {
     echo "  Domain (optional). If a domain or subdomain points at this VPS (DNS A"
     echo "  record), the tunnel gets a real Let's Encrypt certificate for it and"
     echo "  phones connect by name. Leave empty to use the IP."
-    read -r -p "  Domain for the VPS []: " DOMAIN
+    read -r -p "  Domain for the VPS []: " DOMAIN || [[ -n "$DOMAIN" ]] || no_answer "Domain" "Pass it as --domain DOMAIN."
     DOMAIN="${DOMAIN,,}"
     echo ""
     [[ -n "$DOMAIN" ]] || return 0
     validate_domain "$DOMAIN"
     if [[ -z "$ACME_EMAIL" ]]; then
-        read -r -p "  E-mail for certificate expiry notices (optional) []: " ACME_EMAIL
+        read -r -p "  E-mail for certificate expiry notices (optional) []: " ACME_EMAIL \
+            || [[ -n "$ACME_EMAIL" ]] || no_answer "E-mail" "Pass it as --acme-email EMAIL."
         echo ""
         [[ -z "$ACME_EMAIL" ]] || validate_email "$ACME_EMAIL"
     fi
@@ -282,7 +341,8 @@ ask_chroot_tmp() {
         echo "  Chroot /tmp (phone RAM: ${ram:-?} MB):"
         echo "    tmpfs  in RAM (256 MB max), cleared on every reboot"
         echo "    disk   on storage, files unused for 7 days are cleaned"
-        read -r -p "  Choose tmpfs or disk [${def}]: " CHROOT_TMP
+        read -r -p "  Choose tmpfs or disk [${def}]: " CHROOT_TMP \
+            || [[ -n "$CHROOT_TMP" ]] || no_answer "Chroot /tmp" "Pass it as --chroot-tmp $def."
         echo ""
     fi
     CHROOT_TMP="${CHROOT_TMP:-$def}"
@@ -327,6 +387,8 @@ check_prereqs() {
     $VPS_USER ALL=(ALL) NOPASSWD: ALL"
     fi
 
+    save_vps_target
+
     # jq on the VPS
     if ! _vps_cmd "command -v jq >/dev/null 2>&1"; then
         info "jq not found on the VPS — core-vps.sh will install it"
@@ -352,9 +414,10 @@ step_vps_setup() {
     local handoff_path="${SERVERINATOR_CHROOT:-/data/serverinator-root}/etc/wireguard/handoff.json"
     [[ -f "$handoff_path" ]] || die "handoff.json not found: $handoff_path (did step 1 finish correctly?)"
 
-    vps_push "$SCRIPT_DIR/core/lib.sh"      "$VPS_TMP_DIR/lib.sh"
-    vps_push "$SCRIPT_DIR/core/core-vps.sh" "$VPS_TMP_DIR/core-vps.sh"
+    push_vps_scripts
     vps_push "$handoff_path"                "$VPS_TMP_DIR/handoff.json"
+    # First, so `si` is on the VPS even if setup stops halfway.
+    install_vps_scripts
 
     # Build core-vps.sh's arguments
     local vps_args="$VPS_TMP_DIR/handoff.json --vps-ip $VPS_HOST --alias $SSH_ALIAS"
@@ -362,7 +425,12 @@ step_vps_setup() {
     vps_args="$vps_args$(domain_args)"
 
     run_core_vps "$vps_args"
-    install_vps_scripts
+}
+
+push_vps_scripts() {
+    vps_push "$SCRIPT_DIR/core/lib.sh"      "$VPS_TMP_DIR/lib.sh"
+    vps_push "$SCRIPT_DIR/core/core-vps.sh" "$VPS_TMP_DIR/core-vps.sh"
+    vps_push "$SCRIPT_DIR/core/si"          "$VPS_TMP_DIR/si"
 }
 
 # core-vps.sh's domain arguments (each value validated in parse_args/ask_domain).
@@ -388,18 +456,21 @@ run_core_vps() { # ARGS
 
 install_vps_scripts() {
     # Install the scripts in a permanent location on the VPS (for --verify and future runs)
-    # /root/.serverinator/bin/ — alongside the rest of ServerInator's data
-    local vps_bin="/root/.serverinator/bin"
-    if [[ "$VPS_NEEDS_SUDO" == "1" ]]; then
-        _vps_cmd "sudo mkdir -p '$vps_bin' && \
-            sudo cp '$VPS_TMP_DIR/core-vps.sh' '$VPS_TMP_DIR/lib.sh' '$vps_bin/' && \
-            sudo chmod 700 '$vps_bin' && \
-            sudo chmod 600 '$vps_bin/core-vps.sh' '$vps_bin/lib.sh'"
-    else
-        _vps_cmd "mkdir -p '$vps_bin' && \
-            cp '$VPS_TMP_DIR/core-vps.sh' '$VPS_TMP_DIR/lib.sh' '$vps_bin/' && \
-            chmod 700 '$vps_bin' && chmod 600 '$vps_bin/core-vps.sh' '$vps_bin/lib.sh'"
-    fi
+    # /root/.serverinator/bin/ — alongside the rest of ServerInator's data —
+    # and the `si` launcher in /usr/local/bin (it sudoes itself for non-root).
+    local vps_bin="/root/.serverinator/bin" sudo=""
+    [[ "$VPS_NEEDS_SUDO" == "1" ]] && sudo="sudo "
+    _vps_cmd "${sudo}mkdir -p '$vps_bin' && \
+        ${sudo}cp '$VPS_TMP_DIR/core-vps.sh' '$VPS_TMP_DIR/lib.sh' '$VPS_TMP_DIR/si' '$vps_bin/' && \
+        ${sudo}chmod 700 '$vps_bin' && \
+        ${sudo}chmod 600 '$vps_bin/core-vps.sh' '$vps_bin/lib.sh' '$vps_bin/si'"
+    _vps_cmd "${sudo}tee /usr/local/bin/si.new > /dev/null && ${sudo}chmod 755 /usr/local/bin/si.new && \
+        ${sudo}mv -f /usr/local/bin/si.new /usr/local/bin/si" << EOF
+#!/bin/sh
+# ServerInator: the si command (managed). Needs root; uses sudo otherwise.
+[ "\$(id -u)" = 0 ] || exec sudo "\$0" "\$@"
+exec bash $vps_bin/si vps "\$@"
+EOF
     VPS_BIN_DIR="$vps_bin"
 }
 
@@ -516,7 +587,8 @@ fetch_hint_windows() { # REMOTE_PATH (.sh)
 run_set_domain() {
     if [[ -z "$VPS_TARGET" ]]; then
         [[ -t 0 ]] || die "Pass the VPS: --vps user@host"
-        read -r -p "  VPS address (user@host or host): " VPS_TARGET
+        read -r -p "  VPS address (user@host or host): " VPS_TARGET \
+            || [[ -n "$VPS_TARGET" ]] || no_answer "VPS address" "Pass it as --vps user@host."
         echo ""
     fi
     [[ -n "$VPS_TARGET" ]] || die "VPS address cannot be empty"
@@ -536,10 +608,9 @@ run_set_domain() {
     fi
     VPS_TMP_DIR="$(_vps_cmd 'mktemp -d /tmp/serverinator.XXXXXX')"
     [[ -n "$VPS_TMP_DIR" ]] || die "Could not create a temp directory on the VPS"
-    vps_push "$SCRIPT_DIR/core/lib.sh"      "$VPS_TMP_DIR/lib.sh"
-    vps_push "$SCRIPT_DIR/core/core-vps.sh" "$VPS_TMP_DIR/core-vps.sh"
-    run_core_vps "$(domain_args)"
+    push_vps_scripts
     install_vps_scripts
+    run_core_vps "$(domain_args)"
 
     step_apply_back_handoff 2/4 3/4
     step_wss_preflight 4/4 || true
@@ -563,6 +634,7 @@ main() {
     parse_args "$@"
 
     [[ "$DEV" == "1" ]] || check_root_phone
+    install_si_phone
 
     if [[ "$MODE" == authorize ]]; then
         split_vps_target
@@ -601,21 +673,21 @@ main() {
         echo "  Tunnel: wss://${domain} with a real certificate (renewed automatically)"
         echo ""
     fi
-    local sudo="" core="$VPS_BIN_DIR/core-vps.sh" ssh_dir="$VPS_STATE_DIR/ssh"
-    [[ "$VPS_NEEDS_SUDO" == "1" ]] && sudo="sudo "
-    echo "  After rebooting — check the tunnel:"
-    echo "    ssh $VPS_TARGET '${sudo}bash $core --verify --device $DEVICE_NAME'"
+    local ssh_dir="$VPS_STATE_DIR/ssh"
+    echo "  After rebooting — check the tunnel (on the phone, as root):"
+    echo "    si status        this phone's side"
+    echo "    si verify        end to end, from the VPS"
+    echo "  si help lists the rest; on the VPS, si works the same way."
     echo ""
     echo "  Add SSH access for this device (owner):"
     echo "    $(fetch_hint "$ssh_dir/client-setup-owner-${DEVICE_NAME}.sh")"
     echo "    Windows: $(fetch_hint_windows "$ssh_dir/client-setup-owner-${DEVICE_NAME}.sh")"
     echo ""
     echo "  Add access for another device/person (once the tunnel is up):"
-    echo "    ssh $VPS_TARGET '${sudo}bash $core --add-client LABEL --device $DEVICE_NAME'"
+    echo "    si add-client LABEL"
     echo "    $(fetch_hint "$ssh_dir/client-setup-LABEL-${DEVICE_NAME}.sh")"
     echo ""
-    echo "  See every phone on this VPS:"
-    echo "    ssh $VPS_TARGET '${sudo}bash $core --list-devices'"
+    echo "  See every phone on this VPS:  si devices"
     echo ""
 }
 
