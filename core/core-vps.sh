@@ -96,6 +96,9 @@ VPS_IP=""
 SSH_ALIAS=""
 CLIENT_KEYS_MODE=""
 CLIENT_LABEL=""
+CLIENT_GENERATE=0    # --generate-key: the VPS makes the client's key (handed out once)
+CLIENT_EXPIRES=""    # --expires: YYYYMMDD after which the client key stops working
+SCRIPT_WINDOWS=0     # --client-script ... --windows: the PowerShell version
 GUEST_NAME=""
 GUEST_FOLDERS=()     # --folder, repeatable
 GUEST_PUBKEY=""      # --pubkey: the guest's own key instead of a generated one
@@ -110,6 +113,7 @@ DEVICE_RECORD=""     # DEVICES_DIR/<device>.json once selected
 # configs jump through it, so moving to another VPS becomes a DNS change.
 # The choice is VPS-wide and kept in TLS_STATE.
 VPS_DOMAIN=""
+WSTUNNEL_PATH_PREFIX=""  # secret upgrade path (ensure_wstunnel_path_prefix)
 ACME_EMAIL=""
 TLS_CERT_FILE=""     # your own certificate instead of Let's Encrypt
 TLS_KEY_FILE=""
@@ -168,6 +172,20 @@ parse_args() {
                 validate_client_label "$CLIENT_LABEL"
                 ;;
             --list-clients) MODE="list-clients"; shift ;;
+            --client-script)
+                MODE="client-script"; shift
+                [[ $# -gt 0 ]] || die "--client-script requires a LABEL (or owner)"
+                CLIENT_LABEL="$1"; shift
+                validate_client_label "$CLIENT_LABEL"
+                ;;
+            --windows) SCRIPT_WINDOWS=1; shift ;;
+            --generate-key) CLIENT_GENERATE=1; shift ;;
+            --expires)
+                shift
+                [[ $# -gt 0 ]] || die "--expires requires 30d (days from now) or a date like 2026-12-31"
+                CLIENT_EXPIRES="$(parse_expiry "$1")" || exit 1
+                shift
+                ;;
             --add-guest|--guest-access|--revoke-guest)
                 MODE="${1#--}"; shift
                 [[ $# -gt 0 ]] || die "--$MODE requires a NAME"
@@ -261,11 +279,21 @@ parse_args() {
             ;;
         add-client|revoke-client)
             [[ -n "$CLIENT_LABEL" ]] || die "--add-client/--revoke-client requires a LABEL"
+            [[ "$CLIENT_LABEL" != owner ]] \
+                || die "'owner' is the phone's own key from the install; pick another label"
             ;;
+        client-script) ;;
     esac
+    # Only setup takes a file; elsewhere a stray word was silently taken as one.
+    [[ -z "$HANDOFF_FILE" || "$MODE" == setup ]] || die "Unexpected argument: $HANDOFF_FILE"
+    [[ "$CLIENT_GENERATE" == 0 || "$MODE" == add-client ]] || die "--generate-key goes with --add-client"
+    [[ "$CLIENT_GENERATE" == 0 || -z "$GUEST_PUBKEY" ]] || die "--generate-key and --pubkey don't go together"
+    [[ -z "$CLIENT_EXPIRES" || "$MODE" == add-client ]] || die "--expires goes with --add-client"
+    [[ "$SCRIPT_WINDOWS" == 0 || "$MODE" == client-script ]] || die "--windows goes with --client-script"
     [[ ${#GUEST_FOLDERS[@]} -eq 0 || "$MODE" == add-guest || "$MODE" == guest-access ]] \
         || die "--folder goes with --add-guest or --guest-access"
-    [[ -z "$GUEST_PUBKEY" || "$MODE" == add-guest ]] || die "--pubkey goes with --add-guest"
+    [[ -z "$GUEST_PUBKEY" || "$MODE" == add-guest || "$MODE" == add-client ]] \
+        || die "--pubkey goes with --add-client or --add-guest"
 }
 
 # ─────────────────────────────────────────────
@@ -380,7 +408,8 @@ check_device_name_unambiguous() {
 # Number of peer blocks carrying this device's marker.
 peer_block_count() {
     local conf="$1" device="$2"
-    grep -cF "# ServerInator peer: ${device}" "$conf" 2>/dev/null || true
+    # Whole lines: "rn9" must not count "rn9p"'s marker (review B2).
+    grep -cxF "# ServerInator peer: ${device}" "$conf" 2>/dev/null || true
 }
 
 # PublicKey of the device's peer block (empty if not found).
@@ -479,13 +508,28 @@ read_handoff() {
 # Step 2: Install dependencies
 # ─────────────────────────────────────────────
 
+# apt that waits for a fresh VPS's unattended-upgrades instead of failing,
+# and never asks.
+apt_get() {
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 "$@"
+}
+
 install_deps() {
     if [[ "$DEV" == "1" ]]; then dev "DEV: skipping apt install"; return 0; fi
     require_cmd apt-get
     info "Updating package lists..."
-    apt-get update -qq
+    apt_get update -qq
     info "Installing wireguard-tools, iproute2, iputils-ping, curl, openssh-client, jq..."
-    apt-get install -y -qq wireguard-tools iproute2 iputils-ping curl openssh-client jq
+    apt_get install -y -qq wireguard-tools iproute2 iputils-ping curl openssh-client jq
+}
+
+# jq is needed from the first step on; the orchestrator promises that this
+# script installs it (review B3).
+ensure_jq() {
+    have_cmd jq && return 0
+    [[ "$DEV" != 1 ]] && have_cmd apt-get || die "Install jq: apt-get install jq"
+    info "Installing jq..."
+    apt_get update -qq && apt_get install -y -qq jq || die "Could not install jq (apt-get install jq)"
 }
 
 # wstunnel release suffix for this VPS's CPU (SERVERINATOR_VPS_ARCH overrides
@@ -881,7 +925,9 @@ refresh_devices_for_domain() {
     for dev in $(device_names); do
         record="$(device_record_path "$dev")"
         tmp="$(mktemp "${record}.XXXXXX")"; chmod 600 "$tmp"
-        jq --arg d "$VPS_DOMAIN" 'if $d == "" then del(.vps_domain) else . + {vps_domain: $d} end' \
+        jq --arg d "$VPS_DOMAIN" --arg p "${WSTUNNEL_PATH_PREFIX:-}" \
+            '(if $d == "" then del(.vps_domain) else . + {vps_domain: $d} end)
+             | (if $p == "" then . else . + {wstunnel_path_prefix: $p} end)' \
             "$record" > "$tmp" || { rm -f "$tmp"; die "jq: could not update $record"; }
         mv "$tmp" "$record"
         ( SELECTED_DEVICE="$dev"; regenerate_client_scripts ) \
@@ -894,27 +940,28 @@ regenerate_client_scripts() {
     local domain="$VPS_DOMAIN"
     _load_phone_state > /dev/null
     VPS_DOMAIN="$domain"
-    local owner_alias="$SSH_ALIAS" key label f n=0
+    local owner_alias="$SSH_ALIAS" key label f n=0 mode
     if [[ -f "$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh" ]]; then
         key="$SSH_KEY_DIR/owner_${DEVICE_NAME}"
+        if [[ -f "$key" ]]; then mode=1; elif [[ -f "$key.pub" ]]; then mode=2; else mode=0; fi
         _write_client_setup_script "$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh" "$owner_alias" \
-            "si-${DEVICE_NAME}" "$([[ -f "$key" ]] && echo 1 || echo 0)" "$key"
+            "si-${DEVICE_NAME}" "$mode" "$key" owner
         n=$((n + 1))
     fi
     for f in "$SSH_KEY_DIR"/client-setup-*-"${DEVICE_NAME}".sh; do
         [[ -e "$f" ]] || continue
         label="${f##*/client-setup-}"; label="${label%-"${DEVICE_NAME}".sh}"
         [[ "$label" != owner ]] || continue
-        [[ -f "$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}" ]] || continue
-        _write_client_setup_script "$f" "${owner_alias}-${label}" "si-${DEVICE_NAME}-${label}" 1 \
-            "$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}"
+        key="$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}"
+        if [[ -f "$key" ]]; then mode=1; else mode=2; fi
+        _write_client_setup_script "$f" "${owner_alias}-${label}" "si-${DEVICE_NAME}-${label}" "$mode" "$key" "$label"
         n=$((n + 1))
     done
     info "$DEVICE_NAME: rewrote $n client script(s)"
 }
 
 set_domain() {
-    have_cmd jq || die "Install jq: apt-get install jq"
+    ensure_jq
     [[ "$DEV" == 1 || "$(id -u)" == 0 ]] || die "--set-domain needs root"
     # VPS_IP for the DNS check and the IP fallback: from any device record.
     local first
@@ -941,13 +988,43 @@ set_domain() {
     echo "  the VPS now use $(vps_public_host) as the jump host for new machines."
 }
 
+# The secret path prefix phones put in the WebSocket upgrade request
+# (review #12). Without it wstunnel answers every path, and its default
+# path ("v1") is the same on every install, so a scanner can tell it's
+# wstunnel. One per VPS, kept across re-installs, sent to phones in the
+# back-handoff; the server refuses any other path.
+ensure_wstunnel_path_prefix() {
+    local f="$WG_KEY_DIR/wstunnel-path-prefix" p=""
+    mkdir -p "$WG_KEY_DIR"; chmod 700 "$WG_KEY_DIR"
+    [[ -f "$f" ]] && p="$(head -n 1 "$f")"
+    if [[ ! "$p" =~ ^[A-Za-z0-9]{16,64}$ ]]; then
+        p="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+        [[ "$p" =~ ^[A-Za-z0-9]{24}$ ]] || die "Could not make a random wstunnel path prefix"
+        (umask 077; printf '%s\n' "$p" > "$f")
+    fi
+    WSTUNNEL_PATH_PREFIX="$p"
+}
+
 setup_wstunnel_server() {
     local svc="$SYSTEMD_DIR/wstunnel-serverinator.service"
     mkdir -p "$SYSTEMD_DIR"
-    local desired tls_lines=""
+    ensure_wstunnel_path_prefix
+    # The prefix goes in a root-only environment file: the unit file is
+    # world-readable.
+    reconcile_file "$WG_KEY_DIR/wstunnel.env" 600 << EOF
+WSTUNNEL_RESTRICT_HTTP_UPGRADE_PATH_PREFIX=${WSTUNNEL_PATH_PREFIX}
+EOF
+    # wstunnel runs as a throwaway user (DynamicUser) with nothing it
+    # doesn't need (review #12). It can't read the root-only certificate, so
+    # systemd hands it a copy (LoadCredential, under %d); the renewal hook
+    # restarts it to load a new one.
+    local desired tls_lines="" cred_lines=""
     if [[ -n "$VPS_DOMAIN" ]]; then
-        tls_lines="    --tls-certificate ${TLS_CERT_FILE} \\
-    --tls-private-key ${TLS_KEY_FILE} \\
+        tls_lines="    --tls-certificate %d/tls-cert \\
+    --tls-private-key %d/tls-key \\
+"
+        cred_lines="LoadCredential=tls-cert:${TLS_CERT_FILE}
+LoadCredential=tls-key:${TLS_KEY_FILE}
 "
     fi
     desired="$(mktemp "$SYSTEMD_DIR/unit.XXXXXX")"
@@ -957,12 +1034,39 @@ Description=wstunnel server for ServerInator
 After=network.target
 
 [Service]
+# Certificate: ${TLS_CERT_FILE:-built-in self-signed}
+${cred_lines}EnvironmentFile=${WG_KEY_DIR}/wstunnel.env
 ExecStart=${WSTUNNEL_BIN} server \\
     --log-lvl INFO \\
     --restrict-to ${WG_RESTRICT_TARGET} \\
 ${tls_lines}    wss://0.0.0.0:${WSTUNNEL_PORT}
 Restart=on-failure
 RestartSec=5
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -1051,14 +1155,35 @@ _vps_user_home() {
     fi
 }
 
+# parse_expiry 30d|YYYY-MM-DD -> YYYYMMDD (a future date), for --expires.
+parse_expiry() {
+    local spec="$1" day today
+    today="$(date -u +%Y%m%d)"
+    if [[ "$spec" =~ ^([0-9]{1,4})d$ ]]; then
+        day="$(date -u -d "+${BASH_REMATCH[1]} days" +%Y%m%d)" || return 1
+    elif [[ "$spec" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        day="$(date -u -d "$spec" +%Y%m%d 2>/dev/null)" || { error "--expires: no such date: $spec"; return 1; }
+    else
+        error "--expires: use 30d (days from now) or a date like 2026-12-31"; return 1
+    fi
+    [[ "$day" > "$today" ]] || { error "--expires: $spec is not in the future"; return 1; }
+    printf '%s\n' "$day"
+}
+
+# The expiry kept next to a client key (empty: never expires).
+client_expiry() { # KEY_BASE (…/owner_DEV_LABEL)
+    [[ -f "$1.expires" ]] && head -n 1 "$1.expires" | grep -E '^[0-9]{8}$' || true
+}
+
 # Builds the authorized_keys line for a jump key: NEITHER port-forwarding
 # NOR restrict on their own block exec/shell (restrict only disables
 # pty/agent/X11-forwarding and ~/.ssh/rc) — an explicit command= is
 # mandatory, otherwise the key gets a full shell on the VPS.
 _vps_jump_key_line() {
-    local pub="$1" phone_ip="$2" phone_port="$3"
-    printf 'command="echo '\''ServerInator: forwarding-only key, no shell access'\''; exit 1",restrict,port-forwarding,permitopen="%s:%s" %s' \
-        "$phone_ip" "$phone_port" "$pub"
+    local pub="$1" phone_ip="$2" phone_port="$3" expiry="${4:-}" exp=""
+    [[ -z "$expiry" ]] || exp=",expiry-time=\"${expiry}\""
+    printf 'command="echo '\''ServerInator: forwarding-only key, no shell access'\''; exit 1",restrict,port-forwarding,permitopen="%s:%s"%s %s' \
+        "$phone_ip" "$phone_port" "$exp" "$pub"
 }
 
 # Adds a restricted entry to the VPS admin's authorized_keys — only
@@ -1066,7 +1191,7 @@ _vps_jump_key_line() {
 # ProxyJump with a freshly-generated key (which is not yet in the VPS's
 # authorized_keys) would otherwise fail at the jump host.
 _authorize_vps_jump_key() {
-    local pub="$1" phone_ip="$2" phone_port="$3" user_home auth_file line
+    local pub="$1" phone_ip="$2" phone_port="$3" expiry="${4:-}" user_home auth_file line
     user_home="$(_vps_user_home)" || die "Could not get the VPS admin's home directory"
     [[ -n "$user_home" ]] || die "Empty home directory for the VPS admin"
     auth_file="$user_home/.ssh/authorized_keys"
@@ -1074,17 +1199,20 @@ _authorize_vps_jump_key() {
     chmod 700 "$user_home/.ssh"
     touch "$auth_file"
     chmod 600 "$auth_file"
-    line="$(_vps_jump_key_line "$pub" "$phone_ip" "$phone_port")"
-    grep -qFx -- "$line" "$auth_file" || printf '%s\n' "$line" >> "$auth_file"
+    line="$(_vps_jump_key_line "$pub" "$phone_ip" "$phone_port" "$expiry")"
+    grep -qFx -- "$line" "$auth_file" && return 0
+    # Without a final newline the admin's last key would fuse with ours (B4).
+    [[ ! -s "$auth_file" || -z "$(tail -c 1 "$auth_file")" ]] || echo >> "$auth_file"
+    printf '%s\n' "$line" >> "$auth_file"
 }
 
 # Removes the jump entry added by _authorize_vps_jump_key for this key.
 _revoke_vps_jump_key() {
-    local pub="$1" phone_ip="$2" phone_port="$3" user_home auth_file line
+    local pub="$1" phone_ip="$2" phone_port="$3" expiry="${4:-}" user_home auth_file line
     user_home="$(_vps_user_home)" || die "Could not get the VPS admin's home directory"
     auth_file="$user_home/.ssh/authorized_keys"
     [[ -f "$auth_file" ]] || return 0
-    line="$(_vps_jump_key_line "$pub" "$phone_ip" "$phone_port")"
+    line="$(_vps_jump_key_line "$pub" "$phone_ip" "$phone_port" "$expiry")"
     local tmp rc=0
     tmp="$(mktemp "${auth_file}.XXXXXX")" || die "Could not create a temp file next to $auth_file"
     # grep -v exits 1 when no lines remain; that is a valid (empty) result.
@@ -1157,7 +1285,9 @@ setup_vps_ssh_keys() {
     else
         require_cmd ssh-keygen
         local ck="$SSH_KEY_DIR/owner_${DEVICE_NAME}"
-        if [[ ! -f "$ck" ]]; then
+        # The public half decides: after --client-script owner only it stays,
+        # and the owner's devices still hold the private key.
+        if [[ ! -f "$ck.pub" ]]; then
             ssh-keygen -t ed25519 -N '' \
                 -C "serverinator:owner:${DEVICE_NAME}" -f "$ck" >/dev/null
             chmod 600 "$ck"
@@ -1225,63 +1355,66 @@ vps_host_pubkey() {
 # Step 5: Generate client-setup.sh
 # ─────────────────────────────────────────────
 
-# _write_client_setup_script OUT_FILE ALIAS SI_NAME IS_NEW KEY_FILE
-#   OUT_FILE  — where to write the generated script
-#   ALIAS     — SSH Host alias in the client's ~/.ssh/config
-#   SI_NAME   — local identity filename on the client (~/.ssh/SI_NAME)
-#   IS_NEW    — 1 if we generated the key (embed the private key)
-#   KEY_FILE  — path to the private key on the VPS (only needed if IS_NEW=1)
-# Uses the globals DEVICE_NAME, VPS_IP, SSH_VPS_USER, PHONE_WG_IP,
-# SSH_PHONE_PORT, SSH_USER — populated either by read_handoff+setup, or by
-# _load_phone_state (--add-client/--revoke-client).
+# _write_client_setup_script OUT ALIAS SI_NAME MODE KEY_BASE [LABEL]
+# MODE: 1  the VPS made the key: the script carries the private key (handed
+#          out once by --client-script, then deleted here)
+#       0  the owner's existing VPS keys (--client-keys existing): no key
+#       2  the client's own key: the script carries no secret. With
+#          KEY_BASE.pub it only works where that key is; without (pairing)
+#          it makes a key on the device and prints the command to approve it.
+# Each alias gets its own jump block (ALIAS-jump) so one machine can hold
+# keys for several phones or labels.
 _write_client_setup_script() {
-    local out="$1" alias="$2" si_name="$3" is_new="$4" key_file="$5"
+    local out="$1" alias="$2" si_name="$3" mode="$4" key_file="$5" label="${6:-owner}"
     local vhost; vhost="$(vps_public_host)"
-    local jump="${SSH_VPS_USER}@${vhost}"
-    local created
+    local created expected="" fp=""
     created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$mode" == 2 && -f "$key_file.pub" ]]; then
+        expected="$(awk '{print $1" "$2; exit}' "$key_file.pub")"
+        fp="$(ssh_key_fingerprint "$expected" | awk '{print $1}')"
+    fi
 
-    # Private-key section (only if we generated it ourselves)
+    # Where the key lives on the client, and how it gets there.
     local key_lines=""
-    if [[ "$is_new" == "1" ]]; then
-        local b64
+    if [[ "$mode" == 1 ]]; then
+        local b64 pub
         b64="$(base64 -w 0 "$key_file")"
+        pub="$(awk '{print $1" "$2}' "$key_file.pub")"
         key_lines="$(printf '%s\n' \
-            "# Installing the private key (original on the VPS: $key_file)" \
+            "# The private key. This script is its only copy once fetched: keep it safe." \
             "KEY=\"\$HOME/.ssh/${si_name}\"" \
             "if [[ ! -f \"\$KEY\" ]]; then" \
             "    printf '%s' '${b64}' | base64 -d > \"\$KEY\"" \
             "    chmod 600 \"\$KEY\"" \
+            "    printf '%s\\n' '${pub}' > \"\$KEY.pub\"" \
             "    echo \"Key installed: \$KEY\"" \
             "else" \
             "    echo \"Key already present: \$KEY — skipping\"" \
+            "fi")"
+    elif [[ "$mode" == 2 && -n "$expected" ]]; then
+        key_lines="$(printf '%s\n' \
+            "# This device's own key (${fp}). The private key never left it." \
+            "EXPECTED='${expected}'" \
+            "KEY=''" \
+            "for k in \"\$HOME/.ssh/${si_name}\" \"\$HOME\"/.ssh/*; do" \
+            "    [[ -f \"\$k\" && \"\$k\" != *.pub ]] || continue" \
+            "    [[ \"\$(ssh-keygen -y -f \"\$k\" 2>/dev/null | awk '{print \$1\" \"\$2}')\" == \"\$EXPECTED\" ]] && { KEY=\"\$k\"; break; }" \
+            "done" \
+            "if [[ -z \"\$KEY\" ]]; then" \
+            "    echo \"This setup is for the key ${fp}, and that key isn't in ~/.ssh on this device.\" >&2" \
+            "    echo \"Run it on the device the key belongs to, or ask for a new setup.\" >&2" \
+            "    exit 1" \
             "fi" \
-            "")"
-    fi
-
-    # IdentityFile line (empty if the user already had their own key)
-    local id_line=""
-    [[ "$is_new" == "1" ]] \
-        && id_line=$'\n'"    IdentityFile ~/.ssh/${si_name}"
-
-    # For a NEW key, a separate Host block for the VPS itself: ProxyJump
-    # matches ssh_config again against the jump host, not against the
-    # destination block — without this block, a new key (not originally in
-    # the VPS's authorized_keys) would never be offered at the jump host.
-    # The VPS already has a restricted entry for it (port-forwarding to the
-    # phone only, no shell).
-    local jump_host_lines=""
-    if [[ "$is_new" == "1" ]]; then
-        jump_host_lines="$(printf '%s\n' \
-            "if grep -q \"^Host ${vhost}\$\" \"\$CONFIG\" 2>/dev/null; then" \
-            "    echo \"Host ${vhost} is already in \$CONFIG — skipping\"" \
-            "else" \
-            "    printf '\\nHost ${vhost}\\n' >> \"\$CONFIG\"" \
-            "    printf '    User ${SSH_VPS_USER}\\n' >> \"\$CONFIG\"" \
-            "    printf '    IdentityFile ~/.ssh/${si_name}\\n' >> \"\$CONFIG\"" \
-            "    echo \"Host ${vhost} (ProxyJump only) added to \$CONFIG\"" \
-            "fi" \
-            "")"
+            "echo \"Using your key \$KEY\"")"
+    elif [[ "$mode" == 2 ]]; then
+        key_lines="$(printf '%s\n' \
+            "# A key of this device's own; its private part never leaves the device." \
+            "KEY=\"\$HOME/.ssh/${si_name}\"" \
+            "if [[ ! -f \"\$KEY\" ]]; then" \
+            "    command -v ssh-keygen >/dev/null || { echo 'ssh-keygen not found (install the OpenSSH client)' >&2; exit 1; }" \
+            "    ssh-keygen -q -t ed25519 -N '' -C \"serverinator:${label}@\$(hostname 2>/dev/null || echo device)\" -f \"\$KEY\"" \
+            "    echo \"Made a key for this device: \$KEY\"" \
+            "fi")"
     fi
 
     # Host keys to pin on the client: the phone's under the alias name
@@ -1301,6 +1434,32 @@ _write_client_setup_script() {
         done
     fi
 
+    # With a key of ours (modes 1, 2) the jump to the VPS uses it too, in a
+    # block of its own; the VPS has a restricted entry for it (forwarding to
+    # this phone only, no shell). Mode 0 jumps with the owner's own keys.
+    local jump="${SSH_VPS_USER}@${vhost}" id_line="" jump_lines=""
+    if [[ "$mode" != 0 ]]; then
+        jump="${alias}-jump"
+        id_line="    printf '    IdentityFile %s\\n    IdentitiesOnly yes\\n' \"\$KEY\" >> \"\$CONFIG\""$'\n'
+        jump_lines="$(printf '%s\n' \
+            "if grep -q \"^Host ${alias}-jump\$\" \"\$CONFIG\" 2>/dev/null; then" \
+            "    echo \"Host ${alias}-jump is already in \$CONFIG — skipping\"" \
+            "else" \
+            "    printf '\\nHost ${alias}-jump\\n    HostName ${vhost}\\n    User ${SSH_VPS_USER}\\n' >> \"\$CONFIG\"" \
+            "    printf '    IdentityFile %s\\n    IdentitiesOnly yes\\n    HostKeyAlias ${vhost}\\n' \"\$KEY\" >> \"\$CONFIG\"" \
+            "    echo \"Host ${alias}-jump (the hop through the VPS) added to \$CONFIG\"" \
+            "fi")"
+    fi
+
+    local approve=""
+    if [[ "$mode" == 2 && -z "$expected" ]]; then
+        approve="$(printf '%s\n' \
+            "echo \"\"" \
+            "echo \"Last step: approve this device. As root on the phone, or on the VPS:\"" \
+            "echo \"  si add-client ${label} --device ${DEVICE_NAME} --pubkey '\$(awk '{print \$1\" \"\$2}' \"\$KEY.pub\")'\"" \
+            "echo \"Until then, ssh ${alias} is refused.\"")"
+    fi
+
     # Generate the script. Values are substituted NOW (at generation time).
     # \$ and \$HOME below are literal $ for runtime expansion inside the
     # generated script.
@@ -1310,8 +1469,7 @@ _write_client_setup_script() {
 # Alias: ${alias}   VPS: ${VPS_IP}   Created: ${created}
 #
 # Run this on the client device (bash; works out of the box on Linux/Termux;
-# on Windows run the .ps1 next to this file instead):
-#   bash $(basename "$out")
+# on Windows use the PowerShell version: si client-script ${label} --windows).
 set -euo pipefail
 echo "Setting up SSH access to ${DEVICE_NAME} (alias: ${alias})..."
 mkdir -p "\$HOME/.ssh" && chmod 700 "\$HOME/.ssh"
@@ -1327,34 +1485,39 @@ else
     printf '    HostName ${PHONE_WG_IP}\\n' >> "\$CONFIG"
     printf '    Port ${SSH_PHONE_PORT}\\n' >> "\$CONFIG"
     printf '    User ${SSH_USER}\\n' >> "\$CONFIG"
-    printf '    ${id_line:+IdentityFile ~/.ssh/${si_name}\\n}' >> "\$CONFIG"
-    printf '    ProxyJump ${jump}\\n' >> "\$CONFIG"
+${id_line}    printf '    ProxyJump ${jump}\\n' >> "\$CONFIG"
 ${hka_line}    printf '    ServerAliveInterval 60\\n' >> "\$CONFIG"
     printf '    ServerAliveCountMax 9999\\n' >> "\$CONFIG"
     echo "Alias '${alias}' added to ~/.ssh/config"
 fi
 
-${jump_host_lines}
+${jump_lines}
 ${known_hosts_lines}
 echo ""
 echo "Done. Connect with:  ssh ${alias}"
+${approve}
 SETUP_EOF
 
     chmod 600 "$out"
-    _write_client_setup_ps1 "${out%.sh}.ps1" "$alias" "$si_name" "$is_new" "$key_file" "${entries[@]+"${entries[@]}"}"
+    _write_client_setup_ps1 "${out%.sh}.ps1" "$alias" "$si_name" "$mode" "$key_file" "$label" "$expected" \
+        "${entries[@]+"${entries[@]}"}"
 }
 
-# _write_client_setup_ps1 OUT_FILE ALIAS SI_NAME IS_NEW KEY_FILE [KNOWN_HOSTS_ENTRY...]
+# _write_client_setup_ps1 OUT ALIAS SI_NAME MODE KEY_BASE LABEL EXPECTED [KNOWN_HOSTS_ENTRY...]
 # The same setup as the bash script, for Windows PowerShell 5.1+ with the
 # built-in OpenSSH client. Kept to plain ASCII: PowerShell 5 reads a script
 # without a BOM as ANSI. Every substituted value is already validated
-# (host, alias, device name, base64), and none can contain a single quote.
+# (host, alias, device name, base64, key), and none can contain a single quote.
 _write_client_setup_ps1() {
-    local out="$1" alias="$2" si_name="$3" is_new="$4" key_file="$5"; shift 5
+    local out="$1" alias="$2" si_name="$3" mode="$4" key_file="$5" label="$6" expected="$7"; shift 7
     local vhost; vhost="$(vps_public_host)"
-    local jump="${SSH_VPS_USER}@${vhost}" created entry b64=""
+    local jump="${SSH_VPS_USER}@${vhost}" created entry b64="" pub=""
     created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    [[ "$is_new" == "1" ]] && b64="$(base64 -w 0 "$key_file")"
+    if [[ "$mode" == 1 ]]; then
+        b64="$(base64 -w 0 "$key_file")"
+        pub="$(awk '{print $1" "$2}' "$key_file.pub")"
+    fi
+    [[ "$mode" == 0 ]] || jump="${alias}-jump"
 
     {
         cat << PS1_EOF
@@ -1386,24 +1549,59 @@ function Test-Line([string]\$File, [string]\$Line) {
     foreach (\$l in [IO.File]::ReadAllLines(\$File)) { if (\$l -ceq \$Line) { return \$true } }
     return \$false
 }
+# OpenSSH for Windows refuses a key that anyone but its owner can read.
+function Protect-Key([string]\$Path) {
+    if (\$IsLinux -or \$IsMacOS) { chmod 600 \$Path; return }
+    \$Sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    icacls \$Path /inheritance:r /grant:r "*\${Sid}:F" | Out-Null
+}
+function Get-PubOf([string]\$Path) {
+    \$p = (& ssh-keygen -y -f \$Path 2>\$null)
+    if (-not \$p) { return '' }
+    \$f = ([string]\$p).Split(' ')
+    return (\$f[0] + ' ' + \$f[1])
+}
+\$Key = Join-Path \$SshDir '${si_name}'
 PS1_EOF
-        if [[ "$is_new" == "1" ]]; then
+        if [[ "$mode" == 1 ]]; then
             cat << PS1_EOF
 
-# Installing the private key (original on the VPS: ${key_file})
-\$Key = Join-Path \$SshDir '${si_name}'
+# The private key. This script is its only copy once fetched: keep it safe.
 if (-not (Test-Path \$Key)) {
     [IO.File]::WriteAllBytes(\$Key, [Convert]::FromBase64String('${b64}'))
-    if (\$IsLinux -or \$IsMacOS) {
-        chmod 600 \$Key
-    } else {
-        # OpenSSH for Windows refuses a key that anyone but its owner can read.
-        \$Sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        icacls \$Key /inheritance:r /grant:r "*\${Sid}:F" | Out-Null
-    }
+    Protect-Key \$Key
+    [IO.File]::WriteAllText("\$Key.pub", '${pub}' + "\`n")
     Write-Host "Key installed: \$Key"
 } else {
     Write-Host "Key already present: \$Key - skipping"
+}
+PS1_EOF
+        elif [[ "$mode" == 2 && -n "$expected" ]]; then
+            cat << PS1_EOF
+
+# This device's own key. The private key never left it.
+\$Expected = '${expected}'
+\$Found = ''
+foreach (\$k in @(\$Key) + @(Get-ChildItem -File \$SshDir | Where-Object { \$_.Name -notlike '*.pub' } | ForEach-Object { \$_.FullName })) {
+    if ((Test-Path \$k) -and ((Get-PubOf \$k) -ceq \$Expected)) { \$Found = \$k; break }
+}
+if (-not \$Found) {
+    Write-Error "This setup is for another device's key, which isn't in \$SshDir. Ask for a new setup."
+}
+\$Key = \$Found
+Write-Host "Using your key \$Key"
+PS1_EOF
+        elif [[ "$mode" == 2 ]]; then
+            cat << PS1_EOF
+
+# A key of this device's own; its private part never leaves the device.
+if (-not (Test-Path \$Key)) {
+    # An empty passphrase: Windows PowerShell 5 drops a bare '' argument.
+    \$Empty = '""'
+    if ((Get-Variable PSNativeCommandArgumentPassing -ErrorAction SilentlyContinue) -and \$PSNativeCommandArgumentPassing -ne 'Legacy') { \$Empty = '' }
+    & ssh-keygen -q -t ed25519 -N \$Empty -C "serverinator:${label}@\$env:COMPUTERNAME" -f \$Key
+    if (-not (Test-Path \$Key)) { Write-Error 'ssh-keygen did not make a key (is the OpenSSH Client installed?)' }
+    Write-Host "Made a key for this device: \$Key"
 }
 PS1_EOF
         fi
@@ -1415,7 +1613,9 @@ if (Test-Line \$Config 'Host ${alias}') {
 } else {
     \$block = @('', 'Host ${alias}', '    HostName ${PHONE_WG_IP}', '    Port ${SSH_PHONE_PORT}', '    User ${SSH_USER}')
 PS1_EOF
-        [[ "$is_new" == "1" ]] && echo "    \$block += '    IdentityFile ~/.ssh/${si_name}'"
+        if [[ "$mode" != 0 ]]; then
+            echo "    \$block += @(('    IdentityFile ' + \$Key), '    IdentitiesOnly yes')"
+        fi
         echo "    \$block += '    ProxyJump ${jump}'"
         [[ -n "${SSH_HOST_PUBKEY:-}" ]] && echo "    \$block += '    HostKeyAlias ${alias}'"
         cat << PS1_EOF
@@ -1424,14 +1624,14 @@ PS1_EOF
     Write-Host "Alias '${alias}' added to \$Config"
 }
 PS1_EOF
-        if [[ "$is_new" == "1" ]]; then
+        if [[ "$mode" != 0 ]]; then
             cat << PS1_EOF
 
-if (Test-Line \$Config 'Host ${vhost}') {
-    Write-Host "Host ${vhost} is already in \$Config - skipping"
+if (Test-Line \$Config 'Host ${alias}-jump') {
+    Write-Host "Host ${alias}-jump is already in \$Config - skipping"
 } else {
-    Add-Lines \$Config @('', 'Host ${vhost}', '    User ${SSH_VPS_USER}', '    IdentityFile ~/.ssh/${si_name}')
-    Write-Host 'Host ${vhost} (ProxyJump only) added to config'
+    Add-Lines \$Config @('', 'Host ${alias}-jump', '    HostName ${vhost}', '    User ${SSH_VPS_USER}', ('    IdentityFile ' + \$Key), '    IdentitiesOnly yes', '    HostKeyAlias ${vhost}')
+    Write-Host 'Host ${alias}-jump (the hop through the VPS) added to config'
 }
 PS1_EOF
         fi
@@ -1447,6 +1647,14 @@ PS1_EOF
 Write-Host ''
 Write-Host 'Done. Connect with:  ssh ${alias}'
 PS1_EOF
+        if [[ "$mode" == 2 && -z "$expected" ]]; then
+            cat << PS1_EOF
+Write-Host ''
+Write-Host 'Last step: approve this device. As root on the phone, or on the VPS:'
+Write-Host ("  si add-client ${label} --device ${DEVICE_NAME} --pubkey '" + (Get-PubOf \$Key) + "'")
+Write-Host 'Until then, ssh ${alias} is refused.'
+PS1_EOF
+        fi
     } > "$out"
     chmod 600 "$out"
 }
@@ -1454,33 +1662,27 @@ PS1_EOF
 generate_client_setup() {
     [[ "$SSH_ENABLED" == "1" ]] || return 0
 
-    local f="$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh"
-    _write_client_setup_script "$f" "$SSH_ALIAS" "si-${DEVICE_NAME}" \
-        "$SSH_CLIENT_KEY_IS_NEW" "$SSH_KEY_DIR/owner_${DEVICE_NAME}"
+    local f="$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh" key="$SSH_KEY_DIR/owner_${DEVICE_NAME}" mode=0
+    if [[ "$SSH_CLIENT_KEY_IS_NEW" == 1 ]]; then
+        # Handed out once: after --client-script owner only the public key stays.
+        if [[ -f "$key" ]]; then mode=1; else mode=2; fi
+    fi
+    _write_client_setup_script "$f" "$SSH_ALIAS" "si-${DEVICE_NAME}" "$mode" "$key" owner
     info "Client script: $f"
     OWNER_CLIENT_SETUP_PATH="$f"
 }
 
-# One-line command to fetch a root-only file from this VPS onto another
-# device and run it: scp as root, or `sudo cat` for a sudo user.
-fetch_hint() { # PATH
-    local name="${1##*/}" user="${SSH_VPS_USER:-root}"
-    if [[ "$user" == root ]]; then
-        printf '%s' "scp root@${VPS_IP}:$1 . && bash $name"
-    else
-        printf '%s' "ssh ${user}@${VPS_IP} 'sudo cat $1' > $name && bash $name"
-    fi
+# One-line command to fetch a client's setup script from this VPS onto
+# another device and run it. si on the VPS sudoes itself for a sudo user.
+fetch_hint() { # LABEL
+    local label="$1" user="${SSH_VPS_USER:-root}" name="client-setup-$1-${DEVICE_NAME}.sh"
+    printf '%s' "ssh ${user}@${VPS_IP} si client-script ${label} --device ${DEVICE_NAME} > ${name} && bash ${name}"
 }
 
-# The same for Windows PowerShell, fetching the .ps1 next to PATH (.sh).
-fetch_hint_windows() { # PATH
-    local path="${1%.sh}.ps1" user="${SSH_VPS_USER:-root}"
-    local name="${path##*/}"
-    if [[ "$user" == root ]]; then
-        printf '%s' "scp root@${VPS_IP}:$path . ; powershell -ExecutionPolicy Bypass -File .\\$name"
-    else
-        printf '%s' "ssh ${user}@${VPS_IP} 'sudo cat $path' > $name ; powershell -ExecutionPolicy Bypass -File .\\$name"
-    fi
+# The same for Windows PowerShell.
+fetch_hint_windows() { # LABEL
+    local label="$1" user="${SSH_VPS_USER:-root}" name="client-setup-$1-${DEVICE_NAME}.ps1"
+    printf '%s' "ssh ${user}@${VPS_IP} si client-script ${label} --device ${DEVICE_NAME} --windows > ${name} ; powershell -ExecutionPolicy Bypass -File .\\${name}"
 }
 
 # ─────────────────────────────────────────────
@@ -1541,44 +1743,89 @@ _phone_ssh() {
         -i "$vps_key" -p "$SSH_PHONE_PORT" "${SSH_USER}@${PHONE_WG_IP}" "$@"
 }
 
+# Three ways in (owner's call, 2026-10-17: a key per device):
+#   --pubkey KEY     the device's own key; nothing secret leaves it
+#   (no key)         a pairing script: run on the device, it makes a key there
+#                    and prints the --pubkey command to approve it
+#   --generate-key   the VPS makes the key; the script carries it and is
+#                    handed out once (--client-script), then deleted here
+# --expires DATE puts expiry-time on the key, on the phone and on the VPS.
 add_client() {
     _load_phone_state
 
     local ck="$SSH_KEY_DIR/owner_${DEVICE_NAME}_${CLIENT_LABEL}"
-    [[ ! -f "$ck" ]] \
-        || die "Client '${CLIENT_LABEL}' already exists (key $ck) — run --revoke-client ${CLIENT_LABEL} first if you want to replace it"
+    local f="$SSH_KEY_DIR/client-setup-${CLIENT_LABEL}-${DEVICE_NAME}.sh"
+    local alias="${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}-${CLIENT_LABEL}" si_name="si-${DEVICE_NAME}-${CLIENT_LABEL}"
+    [[ ! -f "$ck.pub" ]] \
+        || die "Client '${CLIENT_LABEL}' already exists — run --revoke-client ${CLIENT_LABEL} first if you want to replace it"
 
-    require_cmd ssh-keygen
-    ssh-keygen -t ed25519 -N '' \
-        -C "serverinator:client:${DEVICE_NAME}:${CLIENT_LABEL}" -f "$ck" >/dev/null
-    chmod 600 "$ck"
+    if [[ -z "$GUEST_PUBKEY" && "$CLIENT_GENERATE" == 0 ]]; then
+        _write_client_setup_script "$f" "$alias" "$si_name" 2 "$ck" "$CLIENT_LABEL"
+        echo ""
+        echo "  Pairing script for '${CLIENT_LABEL}' (holds no key): $f"
+        echo "  On that device, run:"
+        echo "    $(fetch_hint "$CLIENT_LABEL")"
+        echo "    Windows: $(fetch_hint_windows "$CLIENT_LABEL")"
+        echo "  It makes the device's own key and prints the command that approves it:"
+        echo "    si add-client ${CLIENT_LABEL} --pubkey 'ssh-ed25519 ...'${CLIENT_EXPIRES:+ --expires DATE}"
+        echo ""
+        return 0
+    fi
 
-    local pub
-    pub="$(cat "$ck.pub")"
-    printf '%s\n' "$pub" | _phone_ssh '
+    local pub mode
+    if [[ -n "$GUEST_PUBKEY" ]]; then
+        pub="${GUEST_PUBKEY} serverinator:client:${DEVICE_NAME}:${CLIENT_LABEL}"
+        local k
+        for k in "$SSH_KEY_DIR"/owner_*.pub; do
+            [[ -f "$k" ]] || continue
+            [[ "$(awk '{print $1" "$2}' "$k")" != "$GUEST_PUBKEY" ]] \
+                || die "That key is already in use (${k##*/}); one key per device"
+        done
+        (umask 077; printf '%s\n' "$pub" > "$ck.pub")
+        mode=2
+    else
+        require_cmd ssh-keygen
+        ssh-keygen -t ed25519 -N '' \
+            -C "serverinator:client:${DEVICE_NAME}:${CLIENT_LABEL}" -f "$ck" >/dev/null
+        chmod 600 "$ck"
+        pub="$(cat "$ck.pub")"
+        mode=1
+    fi
+    if [[ -n "$CLIENT_EXPIRES" ]]; then
+        (umask 077; printf '%s\n' "$CLIENT_EXPIRES" > "$ck.expires")
+    fi
+
+    local line="$pub"
+    [[ -z "$CLIENT_EXPIRES" ]] || line="expiry-time=\"${CLIENT_EXPIRES}\" ${pub}"
+    printf '%s\n' "$line" | _phone_ssh '
         set -e
         mkdir -p ~/.ssh && chmod 700 ~/.ssh
         touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
         key="$(cat)"
-        grep -qFx -- "$key" ~/.ssh/authorized_keys || printf "%s\n" "$key" >> ~/.ssh/authorized_keys
-    ' || { rm -f "$ck" "$ck.pub"; die "Could not add the client key on the phone — is the tunnel up?"; }
+        if ! grep -qFx -- "$key" ~/.ssh/authorized_keys; then
+            [ -z "$(tail -c 1 ~/.ssh/authorized_keys)" ] || echo >> ~/.ssh/authorized_keys
+            printf "%s\n" "$key" >> ~/.ssh/authorized_keys
+        fi
+    ' || { rm -f "$ck" "$ck.pub" "$ck.expires"; die "Could not add the client key on the phone — is the tunnel up?"; }
 
     # This key is not in the VPS's authorized_keys, so ProxyJump with it
     # would fail at the jump host without a restricted jump entry.
-    _authorize_vps_jump_key "$pub" "$PHONE_WG_IP" "$SSH_PHONE_PORT"
+    _authorize_vps_jump_key "$pub" "$PHONE_WG_IP" "$SSH_PHONE_PORT" "$CLIENT_EXPIRES"
 
-    info "Client '${CLIENT_LABEL}' added on the phone"
-
-    local f="$SSH_KEY_DIR/client-setup-${CLIENT_LABEL}-${DEVICE_NAME}.sh"
-    _write_client_setup_script "$f" "${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}-${CLIENT_LABEL}" \
-        "si-${DEVICE_NAME}-${CLIENT_LABEL}" 1 "$ck"
+    info "Client '${CLIENT_LABEL}' added on the phone${CLIENT_EXPIRES:+ (works until ${CLIENT_EXPIRES:0:4}-${CLIENT_EXPIRES:4:2}-${CLIENT_EXPIRES:6:2})}"
+    _write_client_setup_script "$f" "$alias" "$si_name" "$mode" "$ck" "$CLIENT_LABEL"
 
     echo ""
-    echo "  Client script for '${CLIENT_LABEL}': $f"
-    echo "  To connect from that device:"
-    echo "    $(fetch_hint "$f")"
-    echo "  From Windows (PowerShell):"
-    echo "    $(fetch_hint_windows "$f")"
+    if [[ "$mode" == 2 ]]; then
+        echo "  Approved. If that device ran the pairing script, ssh ${alias} works now."
+        echo "  Otherwise, set it up there with:"
+    else
+        echo "  The VPS made this key. Its setup script carries it and can be"
+        echo "  fetched once; after that the private key is deleted here."
+        echo "  On that device, run:"
+    fi
+    echo "    $(fetch_hint "$CLIENT_LABEL")"
+    echo "    Windows: $(fetch_hint_windows "$CLIENT_LABEL")"
     echo ""
 }
 
@@ -1586,32 +1833,105 @@ revoke_client() {
     _load_phone_state
 
     local ck="$SSH_KEY_DIR/owner_${DEVICE_NAME}_${CLIENT_LABEL}"
-    [[ -f "$ck.pub" ]] || die "Client '${CLIENT_LABEL}' not found (no file $ck.pub)"
-    local pub
+    local scripts=("$SSH_KEY_DIR/client-setup-${CLIENT_LABEL}-${DEVICE_NAME}".{sh,ps1})
+    if [[ ! -f "$ck.pub" ]]; then
+        # A pairing script nobody approved yet: nothing to revoke but the script.
+        [[ -f "${scripts[0]}" ]] || die "Client '${CLIENT_LABEL}' not found (no file $ck.pub)"
+        rm -f "${scripts[@]}"
+        info "Pairing for '${CLIENT_LABEL}' cancelled (it was never approved)"
+        return 0
+    fi
+    local pub expiry line
     pub="$(cat "$ck.pub")"
+    expiry="$(client_expiry "$ck")"
+    line="$pub"
+    [[ -z "$expiry" ]] || line="expiry-time=\"${expiry}\" ${pub}"
 
-    local removed
-    removed="$(printf '%s\n' "$pub" | _phone_ssh '
+    # The VPS hop first: it works without the phone, and alone it locks the
+    # key out (every client reaches the phone through it). A lost laptop can
+    # be revoked while the phone is offline (review B5).
+    _revoke_vps_jump_key "$pub" "$PHONE_WG_IP" "$SSH_PHONE_PORT" "$expiry"
+    rm -f "$ck" "${scripts[@]}"
+    info "Client '${CLIENT_LABEL}' can no longer pass the VPS"
+
+    local removed rc=0
+    removed="$(printf '%s\n%s\n' "$pub" "$line" | _phone_ssh '
         set -e
         [ -f ~/.ssh/authorized_keys ] || { echo 0; exit 0; }
-        key="$(cat)"
-        before=$(grep -cFx -- "$key" ~/.ssh/authorized_keys || true)
+        read -r key; read -r line
+        before=$(grep -cFx -e "$key" -e "$line" ~/.ssh/authorized_keys || true)
         tmp=$(mktemp ~/.ssh/authorized_keys.XXXXXX)
-        grep -vFx -- "$key" ~/.ssh/authorized_keys > "$tmp" || [ $? -eq 1 ]
+        grep -vFx -e "$key" -e "$line" ~/.ssh/authorized_keys > "$tmp" || [ $? -eq 1 ]
         chmod 600 "$tmp"
         mv "$tmp" ~/.ssh/authorized_keys
         echo "$before"
-    ')" || die "Could not revoke the client key on the phone — is the tunnel up?"
-
+    ')" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+        warn "The phone didn't answer, so its authorized_keys still lists '${CLIENT_LABEL}'."
+        warn "Run si revoke-client ${CLIENT_LABEL} again once the tunnel is up to clean it."
+        return 1
+    fi
     if [[ "$removed" == "0" ]]; then
         warn "Client key '${CLIENT_LABEL}' was not found in the phone's authorized_keys (maybe already revoked)"
     else
         info "Client '${CLIENT_LABEL}' revoked on the phone"
     fi
-
-    _revoke_vps_jump_key "$pub" "$PHONE_WG_IP" "$SSH_PHONE_PORT"
-    rm -f "$ck" "$ck.pub" "$SSH_KEY_DIR/client-setup-${CLIENT_LABEL}-${DEVICE_NAME}".{sh,ps1}
+    rm -f "$ck.pub" "$ck.expires"
     info "Local files for client '${CLIENT_LABEL}' removed"
+}
+
+# --client-script LABEL [--windows]: prints a client's setup script, made
+# fresh (so a domain change or new host key is in it). A script that
+# carries a key the VPS made is handed out once: afterwards the private key
+# is deleted here and the script only works on the device that has it.
+client_script() {
+    _load_phone_state
+    local label="$CLIENT_LABEL" ck f alias si_name mode
+    if [[ "$label" == owner ]]; then
+        ck="$SSH_KEY_DIR/owner_${DEVICE_NAME}"
+        f="$SSH_KEY_DIR/client-setup-owner-${DEVICE_NAME}.sh"
+        alias="${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}"; si_name="si-${DEVICE_NAME}"
+    else
+        ck="$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}"
+        f="$SSH_KEY_DIR/client-setup-${label}-${DEVICE_NAME}.sh"
+        alias="${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}-${label}"; si_name="si-${DEVICE_NAME}-${label}"
+    fi
+    if [[ -f "$ck" ]]; then mode=1
+    elif [[ -f "$ck.pub" || -f "$f" ]]; then mode=2
+    elif [[ "$label" == owner ]]; then mode=0
+    else die "No client '${label}' for ${DEVICE_NAME} (si clients lists them; si add-client ${label} makes one)"
+    fi
+    _write_client_setup_script "$f" "$alias" "$si_name" "$mode" "$ck" "$label" >&2
+    if [[ "$SCRIPT_WINDOWS" == 1 ]]; then cat "${f%.sh}.ps1"; else cat "$f"; fi
+    if [[ "$mode" == 1 ]]; then
+        rm -f "$ck"
+        _write_client_setup_script "$f" "$alias" "$si_name" 2 "$ck" "$label" >&2
+        warn "That script was the only copy of ${label}'s private key; it's deleted from the VPS now." >&2
+        warn "Fetching it again gives one that only works on the device that ran this one." >&2
+    fi
+}
+
+# Last login per key fingerprint, from sshd's log on this VPS: every client
+# jumps through here, so this sees them all. Fills LAST_SEEN[SHA256:...]
+# with "YYYY-MM-DD HH:MM IP".
+declare -A LAST_SEEN=()
+load_last_seen() {
+    local lines
+    if [[ -n "${SERVERINATOR_AUTH_LOG:-}" ]]; then
+        lines="$(grep -h 'Accepted publickey' "$SERVERINATOR_AUTH_LOG" 2>/dev/null || true)"
+    elif have_cmd journalctl; then
+        lines="$(journalctl --no-pager -q -o short-iso --since -90d _COMM=sshd -g 'Accepted publickey' 2>/dev/null \
+            || journalctl --no-pager -q -o short-iso --since -90d -u ssh -u sshd 2>/dev/null | grep 'Accepted publickey' || true)"
+    else
+        lines="$(grep -h 'Accepted publickey' /var/log/auth.log 2>/dev/null || true)"
+    fi
+    local ts ip fp
+    while read -r ts ip fp; do
+        if [[ "$fp" == SHA256:* ]]; then LAST_SEEN["$fp"]="$ts $ip"; fi
+    done < <(awk '{
+        ip=""; for (i=1; i<=NF; i++) if ($i=="from") ip=$(i+1)
+        t=$1; sub(/T/, " ", t); t=substr(t, 1, 16)
+        print substr(t,1,10) "_" substr(t,12,5), ip, $NF }' <<< "$lines")
 }
 
 # Lists who has SSH access to the phone, from the keys kept on this VPS. Works
@@ -1619,22 +1939,29 @@ revoke_client() {
 # phone's authorized_keys.
 list_clients() {
     _load_phone_state
-    local alias="${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}" f label fp created count=0
+    local alias="${SSH_ALIAS:-$SSH_ALIAS_DEFAULT}" f label fp created count=0 base exp seen pending=()
+    load_last_seen
 
     _list_client_row() { # LABEL ALIAS PUBFILE
-        fp="$(ssh_key_fingerprint "$(cat "$3")")"
+        fp="$(ssh_key_fingerprint "$(cat "$3")" | awk '{print $1}')"
         created="$(date -u -r "$3" +%Y-%m-%d 2>/dev/null || echo '?')"
-        printf '  %-16s %-24s %-10s %s\n' "$1" "$2" "$created" "${fp:-?}"
+        base="${3%.pub}"; exp="$(client_expiry "$base")"
+        if [[ -z "$exp" ]]; then exp=never
+        elif [[ "$exp" < "$(date -u +%Y%m%d)" || "$exp" == "$(date -u +%Y%m%d)" ]]; then exp="EXPIRED"
+        else exp="${exp:0:4}-${exp:4:2}-${exp:6:2}"; fi
+        seen="${LAST_SEEN[$fp]:-}"
+        printf '  %-14s %-20s %-10s %-10s %-16s %-15s %s\n' "$1" "$2" "$created" "$exp" \
+            "${seen:+${seen%% *}}" "${seen:+${seen##* }}" "${fp:0:20}"
     }
 
     echo ""
     echo "  SSH access to ${DEVICE_NAME} (via ${VPS_IP})"
     echo ""
-    printf '  %-16s %-24s %-10s %s\n' LABEL ALIAS CREATED FINGERPRINT
+    printf '  %-14s %-20s %-10s %-10s %-16s %-15s %s\n' LABEL ALIAS CREATED EXPIRES LAST-LOGIN FROM KEY
     if [[ -f "$SSH_KEY_DIR/owner_${DEVICE_NAME}.pub" ]]; then
         _list_client_row owner "$alias" "$SSH_KEY_DIR/owner_${DEVICE_NAME}.pub"
     else
-        printf '  %-16s %s\n' owner "(your existing VPS keys; installed with --client-keys existing)"
+        printf '  %-14s %s\n' owner "(your existing VPS keys; installed with --client-keys existing)"
     fi
     while IFS= read -r f; do
         label="${f##*/owner_${DEVICE_NAME}_}"; label="${label%.pub}"
@@ -1642,8 +1969,15 @@ list_clients() {
         _list_client_row "$label" "${alias}-${label}" "$f"
         count=$((count + 1))
     done < <(device_client_pubs "$DEVICE_NAME")
+    for f in "$SSH_KEY_DIR"/client-setup-*-"${DEVICE_NAME}".sh; do
+        [[ -e "$f" ]] || continue
+        label="${f##*/client-setup-}"; label="${label%-"${DEVICE_NAME}".sh}"
+        [[ "$label" != owner && ! -f "$SSH_KEY_DIR/owner_${DEVICE_NAME}_${label}.pub" ]] || continue
+        pending+=("$label")
+    done
     echo ""
-    info "${count} extra client(s). Add: --add-client LABEL   Remove: --revoke-client LABEL"
+    (( ${#pending[@]} == 0 )) || info "Waiting for approval: ${pending[*]} (si add-client LABEL --pubkey KEY)"
+    info "${count} extra client(s). Add: si add-client LABEL   Remove: si revoke-client LABEL"
 }
 
 # ─────────────────────────────────────────────
@@ -2130,6 +2464,7 @@ uninstall_guest_access() {
 
 generate_back_handoff() {
     local staged record
+    ensure_wstunnel_path_prefix
     record="$(device_record_path "$DEVICE_NAME")"
     mkdir -p "$DEVICES_DIR"
     chmod 700 "$DEVICES_DIR"
@@ -2150,6 +2485,7 @@ generate_back_handoff() {
         --argjson wstunnel_port "$WSTUNNEL_PORT" \
         --arg  ssh_alias       "$SSH_ALIAS" \
         --arg  vps_domain      "$VPS_DOMAIN" \
+        --arg  path_prefix     "${WSTUNNEL_PATH_PREFIX:-}" \
         '{
             version:        $version,
             device_name:    $device_name,
@@ -2161,7 +2497,8 @@ generate_back_handoff() {
             wg_port:        $wg_port,
             wstunnel_port:  $wstunnel_port,
             ssh_alias:      $ssh_alias
-        } + (if $vps_domain == "" then {} else {vps_domain: $vps_domain} end)')" || die "jq: could not assemble the base back-handoff"
+        } + (if $vps_domain == "" then {} else {vps_domain: $vps_domain} end)
+          + (if $path_prefix == "" then {} else {wstunnel_path_prefix: $path_prefix} end)')" || die "jq: could not assemble the base back-handoff"
 
     # SSH fields (conditional)
     if [[ "$SSH_ENABLED" == "1" ]]; then
@@ -2594,6 +2931,7 @@ main() {
         add-client)     add_client;     return ;;
         revoke-client)  revoke_client;  return ;;
         list-clients)   list_clients;   return ;;
+        client-script)  client_script;  return ;;
         set-domain)     set_domain;     return ;;
         add-guest)      add_guest;      return ;;
         guest-access)   guest_access;   return ;;
@@ -2606,7 +2944,7 @@ main() {
     info "ServerInator Core — setting up the VPS"
     [[ "$DEV" == "1" ]] && dev "DEV mode (WG_DIR=$WG_DIR, SYSTEMD_DIR=$SYSTEMD_DIR)"
 
-    have_cmd jq || die "Install jq: apt-get install jq"
+    ensure_jq
 
     step 1/6 "Reading handoff"
     read_handoff
@@ -2637,9 +2975,9 @@ main() {
     if [[ -n "${OWNER_CLIENT_SETUP_PATH:-}" ]]; then
         echo ""
         echo "  To connect from any device:"
-        echo "    $(fetch_hint "$OWNER_CLIENT_SETUP_PATH")"
+        echo "    $(fetch_hint owner)"
         echo "  From Windows (PowerShell):"
-        echo "    $(fetch_hint_windows "$OWNER_CLIENT_SETUP_PATH")"
+        echo "    $(fetch_hint_windows owner)"
         echo ""
     fi
 }

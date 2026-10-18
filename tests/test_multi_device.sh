@@ -44,7 +44,7 @@ echo "Test: with two phones, commands ask which one"
 rc=0; out="$(vps --add-client laptop 2>&1)" || rc=$?
 assert_eq 1 "$rc" 'add-client without --device refused'
 assert_contains "$out" 'Several phones use this VPS: rn11p rn9p' 'names the phones'
-rc=0; vps --add-client laptop --device rn9p > "$tmp/add.log" 2>&1 || rc=$?
+rc=0; vps --add-client laptop --device rn9p --generate-key > "$tmp/add.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'add-client --device rn9p works'
 assert_contains "$(cat "$tmp/add.log")" 'client-setup-laptop-rn9p.sh' 'client issued for rn9p'
 out="$(vps --list-clients --device rn11p 2>&1)"
@@ -79,7 +79,7 @@ assert_contains "$(cat "$devroot/root/.ssh/authorized_keys")" "$rn11p_owner" 'rn
 assert_file_exists "$dev_dir/rn11p.json" 'rn11p record kept'
 assert_file_missing "$key_dir/known_hosts_rn9p" 'pinned host key removed'
 assert_file_exists "$key_dir/known_hosts_rn11p" 'other phone keeps its pinned host key'
-rc=0; vps --add-client tablet > /dev/null 2>&1 || rc=$?
+rc=0; vps --add-client tablet --generate-key > /dev/null 2>&1 || rc=$?
 assert_eq 0 "$rc" 'with one phone left, --device is optional again'
 
 echo "Test: legacy ssh/state.json is moved into devices/"
@@ -99,8 +99,8 @@ got="$(SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/x" SERVERINATOR_SSH_KEY_DI
 assert_eq 'owner_a_phone.pub ' "$got" 'only a_phone belongs to device a'
 
 echo "Test: orchestrator download hints"
-out="$(bash -c 'source "$1"; VPS_TARGET=root@203.0.113.9; VPS_NEEDS_SUDO=0; fetch_hint /etc/wireguard/serverinator/ssh/x.sh' _ "$REPO_ROOT/serverinator.sh")"
-assert_eq 'scp root@203.0.113.9:/etc/wireguard/serverinator/ssh/x.sh . && bash x.sh' "$out" 'root uses scp'
-out="$(bash -c 'source "$1"; VPS_TARGET=deploy@203.0.113.9; VPS_NEEDS_SUDO=1; fetch_hint /etc/wireguard/serverinator/ssh/x.sh' _ "$REPO_ROOT/serverinator.sh")"
-assert_eq "ssh deploy@203.0.113.9 'sudo cat /etc/wireguard/serverinator/ssh/x.sh' > x.sh && bash x.sh" "$out" 'sudo user reads through sudo'
+out="$(bash -c 'source "$1"; VPS_TARGET=root@203.0.113.9; DEVICE_NAME=rn9p; fetch_hint owner' _ "$REPO_ROOT/serverinator.sh")"
+assert_eq 'ssh root@203.0.113.9 si client-script owner --device rn9p > client-setup-owner-rn9p.sh && bash client-setup-owner-rn9p.sh' "$out" 'fetched through si on the VPS'
+out="$(bash -c 'source "$1"; VPS_TARGET=deploy@203.0.113.9; DEVICE_NAME=rn9p; fetch_hint_windows owner' _ "$REPO_ROOT/serverinator.sh")"
+assert_contains "$out" 'ssh deploy@203.0.113.9 si client-script owner --device rn9p --windows > client-setup-owner-rn9p.ps1' 'a sudo user too (si sudoes itself), Windows'
 exit "$TESTS_FAILED"

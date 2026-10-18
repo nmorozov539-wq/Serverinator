@@ -21,8 +21,8 @@ assert_eq 1 "$rc" 'fails before install'
 assert_contains "$(cat "$tmp/none.log")" 'No phone is set up on this VPS' 'explains why'
 
 vps "$tmp/handoff.json" --vps-ip 203.0.113.9 --alias myphone > "$tmp/setup.log" 2>&1
-vps --add-client laptop > /dev/null 2>&1
-vps --add-client friend > /dev/null 2>&1
+vps --add-client laptop --generate-key > /dev/null 2>&1
+vps --add-client friend --generate-key > /dev/null 2>&1
 
 echo "Test: lists owner and clients with their aliases"
 rc=0; out="$(vps --list-clients 2>&1)" || rc=$?

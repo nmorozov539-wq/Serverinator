@@ -32,6 +32,7 @@ vps_flag() { # COMMAND -> FLAG (empty if not a VPS command)
         clients)       echo "--list-clients*" ;;
         add-client)    echo "--add-client*" ;;
         revoke-client) echo "--revoke-client*" ;;
+        client-script) echo "--client-script*" ;;
         guests)        echo "--list-guests*" ;;
         add-guest)     echo "--add-guest*" ;;
         guest-access)  echo "--guest-access*" ;;
@@ -57,7 +58,9 @@ si — ServerInator Core on this phone
   si uninstall [--purge]        remove Core from this phone
 
 On the VPS, through SSH (this phone's device is filled in):
-  si verify | si clients | si add-client LABEL | si revoke-client LABEL
+  si verify | si clients | si revoke-client LABEL
+  si add-client LABEL [--pubkey KEY | --generate-key] [--expires 30d|DATE]
+  si client-script LABEL [--windows] > FILE    a client's setup script
   si guests | si add-guest NAME [--folder F]... | si guest-access NAME --folder F...
   si revoke-guest NAME | si sync-guests | si devices | si remove-device NAME
   si vps ARGS...                anything else core-vps.sh takes
@@ -76,8 +79,12 @@ si — ServerInator Core on the VPS (runs core-vps.sh)
 
   si verify [--device NAME]     check a phone's tunnel end to end
   si devices                    every phone on this VPS
-  si clients                    who can SSH to the phone
-  si add-client LABEL           new client key and setup scripts
+  si clients                    who can SSH to the phone, last login and IP
+  si add-client LABEL           a pairing script: the device makes its own key
+  si add-client LABEL --pubkey KEY|FILE    approve a device's own key
+  si add-client LABEL --generate-key       the VPS makes the key (handed out once)
+      ... --expires 30d|2026-12-31         the key stops working then
+  si client-script LABEL [--windows]       print a setup script (owner too)
   si revoke-client LABEL
   si guests                     files-only guests
   si add-guest NAME [--folder NAME|PATH[:ro|:rw]]... [--pubkey KEY|FILE]
@@ -115,7 +122,11 @@ on_vps() {
     key="$ORCHESTRATOR_SSH_DIR/id_ed25519"
     [[ -f "$key" ]] || die "No SSH key for the VPS at $key. Run: si setup"
     for a in "$@"; do cmd+=" $(printf '%q' "$a")"; done
-    exec ssh -o BatchMode=yes -o "IdentityFile=$key" -o IdentitiesOnly=yes \
+    # A terminal on both ends: ask for one, so VPS commands that ask
+    # questions (si add-guest NAME) can (review B8).
+    local tty=()
+    [[ -t 0 && -t 1 ]] && tty=(-t)
+    exec ssh ${tty[@]+"${tty[@]}"} -o BatchMode=yes -o "IdentityFile=$key" -o IdentitiesOnly=yes \
         -o "UserKnownHostsFile=$ORCHESTRATOR_SSH_DIR/known_hosts" -o ConnectTimeout=30 \
         "$target" "$VPS_SI$cmd"
 }

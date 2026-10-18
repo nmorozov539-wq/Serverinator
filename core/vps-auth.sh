@@ -39,7 +39,9 @@ AUTH_SUDOERS_ASKED=0
 # Remote snippet: append the key read from stdin to ~/.ssh/authorized_keys
 # unless an identical line is already there.
 # shellcheck disable=SC2016  # expanded on the VPS, not here
-AUTH_INSTALL_SNIPPET='umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && k=$(cat) && { grep -qxF -- "$k" ~/.ssh/authorized_keys || printf "%s\n" "$k" >> ~/.ssh/authorized_keys; } && echo SI_KEY_INSTALLED'
+# The tail -c 1 guard: a file without a final newline would fuse its last
+# key with ours (review B4).
+AUTH_INSTALL_SNIPPET='umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && k=$(cat) && { grep -qxF -- "$k" ~/.ssh/authorized_keys || { [ -z "$(tail -c 1 ~/.ssh/authorized_keys)" ] || echo >> ~/.ssh/authorized_keys; printf "%s\n" "$k" >> ~/.ssh/authorized_keys; }; } && echo SI_KEY_INSTALLED'
 
 _auth_pubkey() { cat "$ORCHESTRATOR_SSH_DIR/id_ed25519.pub"; }
 
@@ -170,9 +172,11 @@ auth_route_password() {
 # ── Route 2a: adb ───────────────────────────────────
 
 # The part typed on the other device. Kept short: that device already logs
-# in to this user with a key, so ~/.ssh/authorized_keys exists already.
+# in to this user with a key, so ~/.ssh/authorized_keys exists already. The
+# echo starts a fresh line in case the file lacks a final newline (a blank
+# line is harmless there).
 _auth_remote_append() {
-    printf '%s' "ssh ${VPS_TARGET} \"cat>>.ssh/authorized_keys\""
+    printf '%s' "ssh ${VPS_TARGET} \"echo>>.ssh/authorized_keys; cat>>.ssh/authorized_keys\""
 }
 
 auth_route_adb() {
@@ -253,16 +257,17 @@ auth_chunk_key() { _auth_pubkey | awk '{print $1" "$2}'; }
 # Prints the lines to type. Each chunk line shows a 4-character code: after
 # typing it, `md5sum si.k` should start with that code.
 auth_chunk_commands() {
-    local key part sofar="" i=0 n code op
+    local key part sofar=$'\n' i=0 n code
     key="$(auth_chunk_key)"
     n=$(( (${#key} + AUTH_CHUNK - 1) / AUTH_CHUNK ))
-    printf '  start  umask 077; mkdir -p .ssh\n'
+    # si.k starts with an empty line, so the key can't fuse with the last
+    # line of an authorized_keys that lacks a final newline (review B4).
+    printf '  start  umask 077; mkdir -p .ssh; echo > si.k\n'
     while ((i * AUTH_CHUNK < ${#key})); do
         part="${key:i*AUTH_CHUNK:AUTH_CHUNK}"
         sofar+="$part"
         code="$(printf '%s' "$sofar" | md5sum | cut -c1-4)"
-        op='>>'; ((i == 0)) && op='>'
-        printf "  %d/%d    printf %%s '%s' %s si.k      (check: %s)\n" $((i + 1)) "$n" "$part" "$op" "$code"
+        printf "  %d/%d    printf %%s '%s' >> si.k      (check: %s)\n" $((i + 1)) "$n" "$part" "$code"
         i=$((i + 1))
     done
     printf '  end    echo >> si.k; cat si.k >> .ssh/authorized_keys\n'
@@ -332,12 +337,15 @@ auth_offer_root() {
     fi
     cat > "$script" <<EOF
 key='$pub'
-mode=\$(sshd -T 2>/dev/null | awk '\$1=="permitrootlogin" {print \$2}')
+mode=\$(sshd -T 2>/dev/null | awk 'tolower(\$1)=="permitrootlogin" {print tolower(\$2)}')
 case "\$mode" in
     yes|prohibit-password|without-password)
         umask 077
         mkdir -p /root/.ssh && touch /root/.ssh/authorized_keys
-        grep -qxF -- "\$key" /root/.ssh/authorized_keys || printf '%s\n' "\$key" >> /root/.ssh/authorized_keys
+        if ! grep -qxF -- "\$key" /root/.ssh/authorized_keys; then
+            [ -z "\$(tail -c 1 /root/.ssh/authorized_keys)" ] || echo >> /root/.ssh/authorized_keys
+            printf '%s\n' "\$key" >> /root/.ssh/authorized_keys
+        fi
         echo SI_ROOT_OK ;;
     *) echo "SI_ROOT_NO=\${mode:-unknown}" ;;
 esac

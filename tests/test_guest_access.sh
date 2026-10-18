@@ -108,7 +108,8 @@ if have_sshd="$(command -v sshd || ls /usr/sbin/sshd 2>/dev/null)" && [[ -n "$ha
     printf 'X11Forwarding yes\nInclude %s\n' "$tmp/guests.conf" >> "$tmp/sshd_main"
     rc=0; "$have_sshd" -t -f "$tmp/sshd_main" >/dev/null 2>&1 || rc=$?
     assert_eq 0 "$rc" 'sshd accepts the guest rules'
-    root_eff="$("$have_sshd" -T -f "$tmp/sshd_main" -C user=root,host=x,addr=10.66.69.1 2>/dev/null)"
+    # Lowercased: OpenSSH 10.6 prints the keywords in CamelCase.
+    root_eff="$("$have_sshd" -T -f "$tmp/sshd_main" -C user=root,host=x,addr=10.66.69.1 2>/dev/null | tr "[:upper:]" "[:lower:]")"
     assert_contains "$root_eff" 'chrootdirectory none' 'root is not chrooted'
     assert_contains "$root_eff" 'x11forwarding yes' 'main settings before the include still apply to root'
 fi

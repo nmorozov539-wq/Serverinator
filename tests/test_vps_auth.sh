@@ -59,7 +59,7 @@ echo "Test: chunked typing rebuilds the exact key and the check codes match"
     done < ../chunks.txt
     printf '%s\n' "$(auth_chunk_key)" > ../expected
 )
-assert_eq "$(cat "$tmp/expected")" "$(cat "$tmp/chunkhome/.ssh/authorized_keys" 2>/dev/null)" 'typed chunks produce the key line'
+assert_eq "$(cat "$tmp/expected")" "$(grep -v "^$" "$tmp/chunkhome/.ssh/authorized_keys" 2>/dev/null)" 'typed chunks produce the key line'
 assert_not_contains "$(cat "$tmp/chunks.txt")" 'BADCODE' 'every chunk check code matches'
 assert_file_missing "$tmp/chunkhome/si.k" 'scratch file removed'
 longest="$(awk '{ if (length($0) > m) m = length($0) } END { print m }' "$tmp/typed.txt")"

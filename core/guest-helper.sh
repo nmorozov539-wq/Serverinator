@@ -67,6 +67,8 @@ folder_path_ok() {
         [[ "$p" == "$bad" || "$p" == "$bad"/* ]] && return 1
     done
     [[ "$p" != /srv && "$p" != /root ]] || return 1
+    # Key folders anywhere: a read-write .ssh is root on the phone (review B9).
+    case "/$p/" in */.ssh/*|*/.gnupg/*) return 1 ;; esac
     return 0
 }
 

@@ -115,7 +115,10 @@ reconcile_file() {
         chmod 600 "$backup"
     fi
 
-    desired="$(mktemp "${target}.XXXXXX")" || die "Could not create a temp file for $target"
+    # Staged in BACKUP_DIR when there is one: Magisk runs every executable
+    # file in service.d, so an interrupted run must not leave a runnable
+    # copy next to the target (review 2026-10-18).
+    desired="$(mktemp "${backup_dir}/.$(basename "$target").XXXXXX")" || die "Could not create a temp file for $target"
     cat > "$desired"
     chmod "$mode" "$desired"
 
@@ -134,7 +137,7 @@ reconcile_file() {
         info "Created $target"
     fi
 
-    mv "$desired" "$target"
+    mv "$desired" "$target" || { rm -f "$desired"; die "Could not replace $target"; }
     RECONCILED_CHANGED=1
 }
 
@@ -285,6 +288,13 @@ validate_optional_ports() {
 is_plain_pubkey() {
     [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || return 1
     [[ "$1" =~ ^(ssh-(rsa|dss|ed25519)|ecdsa-sha2-[a-z0-9]+|sk-(ssh-ed25519|ecdsa-sha2-[a-z0-9]+)@openssh.com)[[:space:]]+[A-Za-z0-9+/=]+ ]]
+}
+
+# A client's authorized_keys line: a plain public key, or one that expires
+# (expiry-time="YYYYMMDD", from --add-client --expires).
+is_client_key_line() {
+    is_plain_pubkey "$1" && return 0
+    [[ "$1" =~ ^expiry-time=\"[0-9]{8}\"\ (.*)$ ]] && is_plain_pubkey "${BASH_REMATCH[1]}"
 }
 
 # Prints the public key's fingerprint (empty string on failure).

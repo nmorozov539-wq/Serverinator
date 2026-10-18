@@ -152,17 +152,39 @@ command (it fills in `--device` for this phone).
 
 ### People and devices with full access (clients)
 
-Each client gets its own key, which you can revoke on its own. A client
-has the same root access to the phone as you do.
+Each device gets a key of its own, which you can revoke on its own. A
+client has the same root access to the phone as you do. The private key is
+made on the device and never leaves it:
 
 ```
-si add-client LABEL       # writes client-setup-LABEL-PHONE.sh and .ps1
-si revoke-client LABEL
-si clients
+si add-client laptop          # a pairing script, with no key in it
 ```
 
-Hand the generated setup script to that person, and they run it as in
-step 6. The tunnel must be up when you add a client.
+On the laptop, fetch and run that script (the command is printed; on
+Windows use the `--windows` one). It makes the laptop's key, adds
+`ssh PHONE-ALIAS-laptop` to its ssh config, pins the host keys, and prints
+the command that approves it:
+
+```
+si add-client laptop --pubkey 'ssh-ed25519 AAAA...'
+```
+
+Until then the laptop is refused. Once approved, the script only works on
+the device that holds that key, so a copy of it grants nothing.
+
+```
+si add-client LABEL --pubkey KEY|FILE    # a key you already have
+si add-client LABEL --generate-key       # the VPS makes the key instead (see below)
+si add-client LABEL ... --expires 30d    # or a date: 2026-12-31
+si client-script LABEL [--windows]       # print a setup script again
+si revoke-client LABEL                   # works with the phone offline too
+si clients                               # with each key's last login and address
+```
+
+With `--generate-key` the setup script carries the private key. It can be
+fetched once (`si client-script`); after that the VPS deletes the private
+key. The owner key the installer makes works the same way and never
+expires. The tunnel must be up when you add or revoke a client.
 
 ### Guests: shared folders only
 
@@ -274,8 +296,14 @@ aside first: the script keeps a key that already exists).
   On the phone, guests are chrooted into a directory that holds only bind
   mounts of their folders, read-only is enforced by the mount, and the
   phone accepts a guest's key only from the VPS's tunnel address.
-- **wstunnel isn't an open proxy.** The server runs with `--restrict-to`
-  and only forwards to the local WireGuard port.
+- **wstunnel isn't an open proxy, and runs locked down.** The server runs
+  with `--restrict-to` and only forwards to the local WireGuard port. It
+  runs as a throwaway systemd user with no privileges in a tight sandbox,
+  and only answers a random path made at install (phones get it during
+  setup), so a scanner can't tell what it is.
+- **Private keys stay on their devices.** Client keys are made on the
+  client by default, and the VPS keeps only public keys once a generated
+  key has been handed out.
 - **Host keys are pinned.** The phone's SSH host key is pinned on the VPS
   and in every client script, so connecting to the wrong machine fails
   instead of asking you to trust a new key.
@@ -287,8 +315,11 @@ aside first: the script keeps a key that already exists).
   authenticates both ends. Set `SERVERINATOR_TLS_VERIFY=1` when installing
   to make it verify anyway.
 
-What this does not protect against: anyone with root on the VPS can reach
-the phone as root, and can read guest folders.
+**The VPS must be trusted.** Anyone with root on the VPS can add their own
+key to the phone (it has a key for exactly that, used by `si add-client`),
+reach the phone as root, and read guest folders. Pick a VPS provider and
+an admin login you trust, keep its SSH locked down, and treat a VPS you no
+longer control as a compromised phone: reinstall with `--purge`.
 
 ## Development and tests
 

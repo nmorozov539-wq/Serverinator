@@ -539,12 +539,14 @@ step_wss_preflight() { # [SECTION]
             return 0
         fi
     fi
-    if curl_out="$(curl -sv --max-time 15 \
-            "https://${VPS_HOST}:${wstunnel_port}" 2>&1)"; then
-        ok "WSS: TLS handshake completed (unexpected 200, but the connection is alive)"
-    elif printf '%s\n' "$curl_out" | grep -qiE 'SSL certificate|self.signed|handshake'; then
-        ok "WSS: TLS handshake completed (expected certificate error — all good)"
-    elif printf '%s\n' "$curl_out" | grep -qiE 'timed out|Operation timed|CURLE_OPERATION'; then
+    # Judge by curl's exit code: its -v output says "TLS handshake, Client
+    # hello" before any reply, so text matching took a silent (blocked)
+    # server for a working one (review 2026-10-18, B1).
+    local rc=0
+    curl_out="$(curl -sv --max-time 15 "https://${VPS_HOST}:${wstunnel_port}" 2>&1)" || rc=$?
+    if [[ "$rc" == 0 ]]; then
+        ok "WSS: TLS handshake completed (the server answered)"
+    elif [[ "$rc" == 28 ]] || printf '%s\n' "$curl_out" | grep -qiE 'timed out'; then
         echo ""
         fail "WSS: the connection hung — the provider is blocking the tunnel"
         warn "This VPS ($VPS_HOST) is unreachable from your network."
@@ -553,32 +555,25 @@ step_wss_preflight() { # [SECTION]
         warn "  bash serverinator.sh --vps NEW_VPS ..."
         echo ""
         return 1
+    elif [[ "$rc" =~ ^(35|51|58|60)$ ]] || printf '%s\n' "$curl_out" | grep -qiE 'SSL certificate problem|self.signed certificate'; then
+        ok "WSS: TLS handshake completed (expected certificate error — all good)"
     else
         warn "WSS: unexpected response — check manually after rebooting"
         [[ "$DEV" == "1" ]] && dev "curl output: $(printf '%s\n' "$curl_out" | head -5)"
     fi
 }
 
-# One-line command that downloads a root-only file from the VPS and runs
-# it. A sudo user cannot scp from /etc/wireguard, so read it through sudo.
-fetch_hint() { # REMOTE_PATH
-    local name="${1##*/}"
-    if [[ "$VPS_NEEDS_SUDO" == "1" ]]; then
-        printf '%s' "ssh $VPS_TARGET 'sudo cat $1' > $name && bash $name"
-    else
-        printf '%s' "scp ${VPS_TARGET}:$1 . && bash $name"
-    fi
+# One-line command that fetches a client's setup script from the VPS and
+# runs it. si on the VPS sudoes itself for a sudo user.
+fetch_hint() { # LABEL
+    local name="client-setup-$1-${DEVICE_NAME}.sh"
+    printf '%s' "ssh $VPS_TARGET si client-script $1 --device $DEVICE_NAME > $name && bash $name"
 }
 
-# The same for Windows PowerShell, using the .ps1 next to the .sh.
-fetch_hint_windows() { # REMOTE_PATH (.sh)
-    local path="${1%.sh}.ps1"
-    local name="${path##*/}"
-    if [[ "$VPS_NEEDS_SUDO" == "1" ]]; then
-        printf '%s' "ssh $VPS_TARGET 'sudo cat $path' > $name ; powershell -ExecutionPolicy Bypass -File .\\$name"
-    else
-        printf '%s' "scp ${VPS_TARGET}:$path . ; powershell -ExecutionPolicy Bypass -File .\\$name"
-    fi
+# The same for Windows PowerShell.
+fetch_hint_windows() { # LABEL
+    local name="client-setup-$1-${DEVICE_NAME}.ps1"
+    printf '%s' "ssh $VPS_TARGET si client-script $1 --device $DEVICE_NAME --windows > $name ; powershell -ExecutionPolicy Bypass -File .\\$name"
 }
 
 # Moves an existing install to DOMAIN (or back to the IP): the VPS gets the
@@ -673,19 +668,18 @@ main() {
         echo "  Tunnel: wss://${domain} with a real certificate (renewed automatically)"
         echo ""
     fi
-    local ssh_dir="$VPS_STATE_DIR/ssh"
     echo "  After rebooting — check the tunnel (on the phone, as root):"
     echo "    si status        this phone's side"
     echo "    si verify        end to end, from the VPS"
     echo "  si help lists the rest; on the VPS, si works the same way."
     echo ""
-    echo "  Add SSH access for this device (owner):"
-    echo "    $(fetch_hint "$ssh_dir/client-setup-owner-${DEVICE_NAME}.sh")"
-    echo "    Windows: $(fetch_hint_windows "$ssh_dir/client-setup-owner-${DEVICE_NAME}.sh")"
+    echo "  SSH access for your main computer (the owner key; the script carries"
+    echo "  it and can be fetched once, then the VPS keeps only the public key):"
+    echo "    $(fetch_hint owner)"
+    echo "    Windows: $(fetch_hint_windows owner)"
     echo ""
-    echo "  Add access for another device/person (once the tunnel is up):"
-    echo "    si add-client LABEL"
-    echo "    $(fetch_hint "$ssh_dir/client-setup-LABEL-${DEVICE_NAME}.sh")"
+    echo "  Each other device gets a key of its own (once the tunnel is up):"
+    echo "    si add-client LABEL          prints how to pair that device"
     echo ""
     echo "  See every phone on this VPS:  si devices"
     echo ""

@@ -80,7 +80,7 @@ assert_file_exists "$unit" 'wstunnel unit written'
 assert_not_contains "$(cat "$unit")" '--tls-certificate' 'no certificate options'
 assert_file_missing "$tls_state" 'no tls.json'
 assert_eq "" "$(jq -r '.vps_domain // ""' "$record")" 'device record has no domain'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" "ProxyJump $u@203.0.113.9" 'client script jumps through the IP'
+assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" 'HostName 203.0.113.9' 'client script jumps through the IP'
 
 echo "Test: --set-domain refuses a domain that doesn't resolve"
 DNS_ANSWER=""
@@ -113,16 +113,17 @@ out="$(vps --set-domain "$D" --acme-email me@example.org)"
 assert_contains "$out" "$D points to this VPS" 'DNS checked'
 assert_contains "$(cat "$FAKE_LOG")" "certonly --standalone --non-interactive --agree-tos" 'certbot standalone, non-interactive'
 assert_contains "$(cat "$FAKE_LOG")" "-d $D --cert-name $D --email me@example.org" 'for the domain, with the e-mail'
-assert_contains "$(cat "$unit")" "--tls-certificate $le/live/$D/fullchain.pem" 'wstunnel serves the certificate'
-assert_contains "$(cat "$unit")" "--tls-private-key $le/live/$D/privkey.pem" 'and its key'
+assert_contains "$(cat "$unit")" "LoadCredential=tls-cert:$le/live/$D/fullchain.pem" 'wstunnel gets the certificate'
+assert_contains "$(cat "$unit")" "LoadCredential=tls-key:$le/live/$D/privkey.pem" 'and its key'
+assert_contains "$(cat "$unit")" '--tls-certificate %d/tls-cert' 'served from the credentials folder'
 assert_eq "$D letsencrypt" "$(jq -r '"\(.domain) \(.source)"' "$tls_state" 2>/dev/null)" 'choice saved in tls.json'
 assert_eq "$D" "$(jq -r '.vps_domain // ""' "$record")" 'device record now carries the domain'
 assert_eq 203.0.113.9 "$(jq -r '.vps_ip' "$record")" 'and still the IP'
 hook="$le/renewal-hooks/deploy/serverinator-wstunnel.sh"
 assert_file_exists "$hook" 'renewal hook written'
 assert_contains "$(cat "$hook" 2>/dev/null)" 'systemctl try-restart wstunnel-serverinator.service' 'hook restarts wstunnel'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" "ProxyJump $u@$D" 'owner script rewritten to jump through the domain'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.ps1")" "'    ProxyJump $u@$D'" 'and the Windows one'
+assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" "HostName $D" 'owner script rewritten to jump through the domain'
+assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.ps1")" "'    HostName $D'" 'and the Windows one'
 assert_contains "$out" "bash serverinator.sh --set-domain $D" 'tells you what to run on each phone'
 
 echo "Test: a web server on port 80 is paused during the check"
@@ -144,16 +145,16 @@ assert_contains "$(cat "$unit")" '--tls-certificate' 'a plain re-install keeps t
 assert_eq "$D" "$(jq -r '.vps_domain // ""' "$record")" 'and the record keeps it'
 
 echo "Test: --add-client after the move jumps through the domain"
-vps --add-client laptop > "$tmp/add.log"
-assert_contains "$(cat "$key_dir/client-setup-laptop-rn9p.sh")" "Host $D" 'jump-host block for the domain'
-assert_contains "$(cat "$key_dir/client-setup-laptop-rn9p.ps1")" "'Host $D'" 'in the .ps1 too'
+vps --add-client laptop --generate-key > "$tmp/add.log"
+assert_contains "$(cat "$key_dir/client-setup-laptop-rn9p.sh")" "HostName $D" 'jump block for the domain'
+assert_contains "$(cat "$key_dir/client-setup-laptop-rn9p.ps1")" "'    HostName $D'" 'in the .ps1 too'
 
 echo "Test: --remove-domain goes back to the self-signed certificate"
 out="$(vps --remove-domain)"
 assert_not_contains "$(cat "$unit")" '--tls-certificate' 'certificate options gone'
 assert_file_missing "$tls_state" 'tls.json removed'
 assert_eq "" "$(jq -r '.vps_domain // ""' "$record")" 'record back on the IP'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" "ProxyJump $u@203.0.113.9" 'client script back on the IP'
+assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" 'HostName 203.0.113.9' 'client script back on the IP'
 assert_contains "$out" 'bash serverinator.sh --remove-domain' 'tells you what to run on each phone'
 
 echo "Test: your own certificate"
@@ -171,7 +172,7 @@ assert_contains "$out" "doesn't go with --tls-cert" 'no e-mail with your own cer
 out="$(vps --set-domain "$D" --tls-cert relative.pem --tls-key "$tmp/own.key")"
 assert_contains "$out" 'absolute' 'paths must be absolute'
 out="$(vps --set-domain "$D" --tls-cert "$tmp/own.pem" --tls-key "$tmp/own.key")"
-assert_contains "$(cat "$unit")" "--tls-certificate $tmp/own.pem" 'wstunnel serves your certificate'
+assert_contains "$(cat "$unit")" "LoadCredential=tls-cert:$tmp/own.pem" 'wstunnel serves your certificate'
 assert_eq custom "$(jq -r .source "$tls_state" 2>/dev/null)" 'saved as custom'
 assert_eq "" "$(cat "$FAKE_LOG")" 'certbot not involved'
 assert_contains "$out" 'your own certificate' 'says whose certificate it is'

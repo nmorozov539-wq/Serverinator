@@ -112,7 +112,8 @@ parse_args() {
                 [[ $# -gt 0 ]] || die "--chroot-tmp requires tmpfs or disk"
                 CHROOT_TMP_MODE="$1"; shift
                 ;;
-            -*) die "Unknown argument: $1" ;;
+            # Without this a stray word looped forever (review B6).
+            *) die "Unknown argument: $1" ;;
         esac
     done
 }
@@ -159,7 +160,7 @@ check_disk_space() {
         fi
     done
     local available_kb
-    available_kb="$(df "$check_path" | awk 'NR==2{print $4}')"
+    available_kb="$(df -P "$check_path" | awk 'NR==2{print $4}')"
     if [[ "$available_kb" -lt "$required_kb" ]]; then
         die "Not enough disk space. Required: 500 MB, available: $(( available_kb / 1024 )) MB"
     fi
@@ -616,7 +617,7 @@ ensure_sshd_include() {
             cat "$main"
         fi
     } > "$tmp"
-    reconcile_file "$main" 600 < "$tmp"
+    reconcile_file "$main" 600 "$STATE_DIR/backups" < "$tmp"
     rm -f "$tmp"
 }
 
@@ -902,17 +903,22 @@ EOF
     info "sshd autostart written: $script_path"
 }
 
-# write_wstunnel_autostart VPS_IP [DOMAIN]
+# write_wstunnel_autostart VPS_IP [DOMAIN [PATH_PREFIX]]
 # Called only from apply_back_handoff — once the VPS IP is known. With a
 # DOMAIN the tunnel connects by name, so the VPS's real certificate matches;
 # SERVERINATOR_TLS_VERIFY=1 also makes wstunnel check that certificate.
 # Values are substituted directly; no placeholders, no sed.
 write_wstunnel_autostart() {
-    local vps_ip="$1" domain="${2:-}"
+    local vps_ip="$1" domain="${2:-}" prefix="${3:-}"
     [[ -n "$vps_ip" ]] || die "write_wstunnel_autostart: VPS IP not provided"
     validate_host "$vps_ip"
     [[ -z "$domain" ]] || validate_domain "$domain"
-    local endpoint="${domain:-$vps_ip}" verify_line=""
+    local endpoint="${domain:-$vps_ip}" verify_line="" prefix_line=""
+    if [[ -n "$prefix" ]]; then
+        [[ "$prefix" =~ ^[A-Za-z0-9]{16,64}$ ]] || die "back-handoff: odd wstunnel_path_prefix"
+        prefix_line="        --http-upgrade-path-prefix ${prefix} \\
+"
+    fi
     if [[ "${SERVERINATOR_TLS_VERIFY:-0}" == 1 ]]; then
         [[ -n "$domain" ]] || die "SERVERINATOR_TLS_VERIFY=1 needs a domain with a real certificate"
         verify_line="        --tls-verify-certificate \\
@@ -986,7 +992,7 @@ while true; do
         PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\
         HOME=/root TMPDIR=/tmp /usr/local/bin/wstunnel client \\
         --log-lvl INFO \\
-${verify_line}        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VPS_PORT}?timeout_sec=0" \\
+${verify_line}${prefix_line}        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VPS_PORT}?timeout_sec=0" \\
         wss://${endpoint}:${WSTUNNEL_PORT} \\
         >> "\$LOG" 2>&1 &
     child=\$!
@@ -1188,7 +1194,7 @@ EOF
     info "WireGuard client config written to $wg_conf"
 
     # ── Write the wstunnel autostart with the real VPS IP ──
-    write_wstunnel_autostart "$vps_ip" "$vps_domain"
+    write_wstunnel_autostart "$vps_ip" "$vps_domain" "$(json_get "$BACK_HANDOFF_FILE" wstunnel_path_prefix)"
 
     # ── Write WireGuard autostart script ──────
     local wg_script="$MAGISK_SERVICE_D/20-serverinator-wireguard.sh"
@@ -1496,7 +1502,8 @@ uninstall_phone() {
                 tmpclean) script="$MAGISK_SERVICE_D/40-serverinator-tmpclean.sh";;
             esac
             file="$STATE_DIR/run/$name-supervisor.pid"
-            if [[ -f "$file" ]]; then read -r pid < "$file"; stop_exact_pid "$pid" "$script" supervisor; fi
+            # An empty pid file must not abort the uninstall under set -e.
+            if [[ -f "$file" ]] && read -r pid < "$file"; then stop_exact_pid "$pid" "$script" supervisor; fi
             # Covers legacy boot scripts without PID files; no name-wide pkill.
             for proc in /proc/[0-9]*; do
                 # Android host access(R_OK) may report false even when root can
@@ -1641,7 +1648,7 @@ phone_status() {
 IDENTITY_TOP="serverinator-identity"
 
 # Prints authorized_keys lines that live outside the managed block and are
-# plain public keys (no options), one per line.
+# plain public keys (no options but a client's expiry-time), one per line.
 extra_authorized_keys() {
     local ak="$1" line in_block=0
     [[ -f "$ak" ]] || return 0
@@ -1650,7 +1657,7 @@ extra_authorized_keys() {
         if [[ "$line" == "$AK_END" ]]; then in_block=0; continue; fi
         ((in_block)) && continue
         [[ "$line" =~ [[:space:]](serverinator-vps-|serverinator:owner:)[^[:space:]]*$ ]] && continue
-        is_plain_pubkey "$line" && printf '%s\n' "$line"
+        is_client_key_line "$line" && printf '%s\n' "$line"
     done < "$ak"
     return 0
 }
@@ -1767,7 +1774,7 @@ import_identity() {
     done
     if [[ -f "$top/extra-keys" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ -z "$line" ]] || is_plain_pubkey "$line" \
+            [[ -z "$line" ]] || is_client_key_line "$line" \
                 || { rm -rf "$stage"; die "extra-keys has a line that isn't a public key"; }
         done < "$top/extra-keys"
     fi
@@ -1887,7 +1894,7 @@ main() {
 
     step 4/4 "Generating handoff"
     generate_handoff
-    info "Phone configured. Run serverinator.sh --apply-back-handoff BACK_HANDOFF.json"
+    info "Phone side ready; the VPS side comes next (serverinator.sh does it)"
 }
 
 # Only run when executed directly; allows the functions to be sourced by tests.

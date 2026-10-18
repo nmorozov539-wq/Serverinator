@@ -2,7 +2,7 @@
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-export SERVERINATOR_DEV=0 SERVERINATOR_CHROOT="$tmp/root" SERVERINATOR_SERVICE_D="$tmp/service"
+export SERVERINATOR_DEV=0 SERVERINATOR_CHROOT="$tmp/root" SERVERINATOR_SERVICE_D="$tmp/service" SERVERINATOR_STATE_DIR="$tmp/state"
 mkdir -p "$SERVERINATOR_CHROOT/etc/ssh"
 printf '# Include /etc/ssh/sshd_config.d/*.conf\nPasswordAuthentication yes\n' > "$SERVERINATOR_CHROOT/etc/ssh/sshd_config"
 source "${TEST_PHONE_SCRIPT:-$PHONE_SCRIPT}"; set +e
