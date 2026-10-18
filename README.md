@@ -1,5 +1,7 @@
 # ServerInator
 
+[![tests](https://github.com/nmorozov539-wq/Serverinator/actions/workflows/tests.yml/badge.svg)](https://github.com/nmorozov539-wq/Serverinator/actions/workflows/tests.yml)
+
 ServerInator turns a rooted Android phone into an always-on Linux server
 that you reach over SSH through a VPS you own.
 
@@ -8,6 +10,9 @@ the VPS. Nothing is opened on the phone or your router, and no third-party
 relay is involved. The link between them is WireGuard carried inside a
 WebSocket-over-TLS connection, so to a network in between it looks like
 ordinary HTTPS. That matters on networks that block plain WireGuard.
+
+**Status: early.** Tested on a Redmi Note 9 Pro and a Redmi Note 11 Pro
+(Android 16), with a Debian/Ubuntu VPS.
 
 ## How it works
 
@@ -18,8 +23,26 @@ your laptop ──SSH (ProxyJump)──▶ VPS ──WireGuard──▶ phone: s
                                    the phone dials out
 ```
 
-- **Chroot on the phone.** A Debian (via `debootstrap`) or Ubuntu 24.04
-  base userspace running on the phone's own kernel. No custom ROM needed.
+### Quick start
+
+On the phone, in Termux:
+
+```
+pkg install git
+git clone https://github.com/nmorozov539-wq/Serverinator
+cd Serverinator
+su    # then:
+bash serverinator.sh
+```
+
+Answer its questions (your VPS as `user@host`, a name for the phone). At
+the end it prints one command to run on your computer, which sets up
+`ssh PHONE-ALIAS`. The details are under [Install](#install).
+
+- **Chroot on the phone.** A Linux userspace running on the phone's own
+  kernel. No custom ROM needed. You don't pick the distribution: it is
+  Debian when `debootstrap` is on the phone, and the Ubuntu 24.04 base
+  otherwise.
 - **wstunnel** wraps WireGuard's UDP packets in a TLS WebSocket
   connection that the phone opens to the VPS on TCP port 9443.
 - **WireGuard** is the private network between the VPS and the phone
@@ -51,8 +74,17 @@ Your laptop (or any client) only needs an OpenSSH client.
 
 ## Install
 
-1. **Copy this repo onto the phone** (`git clone` in Termux, or
-   `adb push`) and open a root shell in it.
+1. **Copy this repo onto the phone** and open a root shell in it. In
+   Termux:
+
+   ```
+   pkg install git
+   git clone https://github.com/nmorozov539-wq/Serverinator
+   cd Serverinator
+   su
+   ```
+
+   (`adb push` of the folder works too.)
 
 2. **Run the installer.** It first checks the phone (Magisk, CPU type,
    free space, RAM, and whether the kernel can make a WireGuard
@@ -110,11 +142,14 @@ Your laptop (or any client) only needs an OpenSSH client.
    ssh PHONE-ALIAS
    ```
 
-   On Windows, use the PowerShell version next to it:
+   On Windows, fetch the same script and let
+   [`tools/client-setup-windows.ps1`](tools/client-setup-windows.ps1) from
+   this repo apply it with Windows' built-in OpenSSH. The tool hasn't run
+   on a real Windows machine yet, so treat it as untested:
 
    ```
-   scp your-vps:/etc/wireguard/serverinator/ssh/client-setup-owner-PHONE.ps1 .
-   powershell -ExecutionPolicy Bypass -File .\client-setup-owner-PHONE.ps1
+   scp your-vps:/etc/wireguard/serverinator/ssh/client-setup-owner-PHONE.sh .
+   powershell -ExecutionPolicy Bypass -File client-setup-windows.ps1 client-setup-owner-PHONE.sh
    ```
 
 The commands above and below assume you log in to the VPS as root. With a
@@ -122,6 +157,28 @@ sudo user, fetch files with `ssh your-vps 'sudo cat FILE' > FILE` instead
 of `scp`; `si` on the VPS uses sudo by itself. At the end of the install
 the installer prints the exact commands for your setup, so you can copy
 them from there.
+
+## Freeing up the phone
+
+A phone running as a server has Android's own apps and services running
+too. Turning off the ones you don't need frees RAM, saves battery and
+keeps the phone cooler. ServerInator doesn't do this for you: phones
+differ too much, and a wrong choice can break the phone. You can do it by
+hand, reversibly.
+
+- **Find the heavy ones.** Settings → Battery shows what uses power;
+  `dumpsys meminfo` (as root) lists apps by memory, largest first.
+  `pm list packages -3` lists apps you installed, and `pm list packages`
+  everything.
+- **Turn one off:** `pm disable-user --user 0 PACKAGE`. It stops running
+  and disappears from the launcher, but stays installed.
+- **Undo it:** `pm enable PACKAGE`.
+
+Leave system-critical packages alone: anything named `android`,
+`com.android.systemui`, `com.android.phone`, the launcher, Settings,
+Google Play services if other apps need it, and Magisk. If the phone
+misbehaves after a change, enable the last package again. A factory reset
+undoes everything, including ServerInator.
 
 ## The si command
 
@@ -168,7 +225,8 @@ si add-client laptop          # a pairing script, with no key in it
 ```
 
 On the laptop, fetch and run that script (the command is printed; on
-Windows use the `--windows` one). It makes the laptop's key, adds
+Windows, run it through `tools/client-setup-windows.ps1`, which is
+untested). It makes the laptop's key, adds
 `ssh PHONE-ALIAS-laptop` to its ssh config, pins the host keys, and prints
 the command that approves it:
 
@@ -183,7 +241,7 @@ the device that holds that key, so a copy of it grants nothing.
 si add-client LABEL --pubkey KEY|FILE    # a key you already have
 si add-client LABEL --generate-key       # the VPS makes the key instead (see below)
 si add-client LABEL ... --expires 30d    # or a date: 2026-12-31
-si client-script LABEL [--windows]       # print a setup script again
+si client-script LABEL                   # print a setup script again
 si revoke-client LABEL                   # works with the phone offline too
 si clients                               # with each key's last login and address
 ```
@@ -193,28 +251,38 @@ fetched once (`si client-script`); after that the VPS deletes the private
 key. The owner key the installer makes works the same way and never
 expires. The tunnel must be up when you add or revoke a client.
 
-### Guests: shared folders only
+### Guests
 
-A guest gets files only: no shell, and only the folders you choose, each
-read-only or read-write. They connect with an SFTP app (FileZilla, WinSCP,
-an Android SFTP client) to the VPS's normal SSH port as user
-`serverinator-files`, using a key file. The VPS forwards them to the
-phone, so no new port is opened.
+A guest is a key you add, in one of two modes:
+
+- **Files only:** one folder on the phone, read-only or read-write, and
+  nothing else. The guest connects with an SFTP app (FileZilla, WinSCP,
+  an Android SFTP client) to the VPS's normal SSH port as user
+  `serverinator-files`, using a key file. The VPS forwards them to the
+  phone, where they are locked into that folder.
+- **Shell user:** a normal Linux user in the phone's chroot, with a home
+  folder and a shell. They see the whole system, limited by ordinary file
+  permissions, with no root and no sudo. They get a setup script like a
+  client's, and connect with `ssh` through the VPS.
+
+Either way no new port is opened, and guest keys don't expire.
 
 ```
-si add-guest anna                        # asks for folders (on the VPS)
-si add-guest anna --folder photos        # /srv/files/photos on the phone
+si add-guest anna --folder photos        # /srv/files/photos on the phone, read-write
 si add-guest anna --folder /root/music:ro
-si add-guest anna --pubkey anna.pub      # use the guest's own ed25519 key
-si guest-access anna --folder photos     # replaces anna's folder list
-si revoke-guest anna                     # her files stay on the phone
-si guests                                # includes folder sizes
+si add-guest anna                        # asks which mode and folder (on the VPS)
+si add-guest bob --shell                 # a shell user with a home folder
+si add-guest bob --shell --pubkey bob.pub   # use the guest's own ed25519 key (either mode)
+si guests                                # with folder sizes
+si revoke-guest anna                     # the shared folder and its files stay
 si sync-guests                           # re-create guests after a phone reset
 ```
 
-`si add-guest` prints what to type into the app and where the guest's key
-file is. Fetch that key with your own admin login: a client key can only
-jump through to the phone, not read files on the VPS.
+To change a guest's folder or mode, revoke it and add it again.
+`si add-guest` prints what to type into the app and where the key file is
+(files only), or where the setup script is (shell user). Fetch it with your
+own admin login: a client key can only jump through to the phone, not read
+files on the VPS. Revoking a shell user deletes its home folder.
 
 ### Several phones on one VPS
 
@@ -300,11 +368,17 @@ aside first: the script keeps a key that already exists).
   key is limited to forwarding to the phone's SSH port
   (`restrict,port-forwarding,permitopen=...`), with a forced command that
   refuses a shell.
-- **Guest keys can only reach their own files.** On the VPS a guest key
-  runs one forced command, the hop to that guest's user on the phone.
-  On the phone, guests are chrooted into a directory that holds only bind
-  mounts of their folders, read-only is enforced by the mount, and the
-  phone accepts a guest's key only from the VPS's tunnel address.
+- **Files-only guests can only reach their folder.** On the VPS such a
+  key runs one forced command, the hop to that guest's user on the phone.
+  On the phone, the guest is chrooted into a directory that holds only a
+  bind mount of the folder, read-only is enforced by the mount, and the
+  phone accepts the hop only from the VPS's tunnel address.
+- **Shell guests are ordinary users.** On the VPS their key can only
+  forward to the phone's SSH port, like a client's. On the phone they are
+  normal accounts with no root or sudo, the phone accepts their key only
+  from the VPS's tunnel address, and only the key you added logs them in.
+  They can read whatever ordinary permissions allow, so keep private files
+  out of world-readable places.
 - **wstunnel isn't an open proxy, and runs locked down.** The server runs
   with `--restrict-to` and only forwards to the local WireGuard port. It
   runs as a throwaway systemd user with no privileges in a tight sandbox,
@@ -326,7 +400,7 @@ aside first: the script keeps a key that already exists).
 
 **The VPS must be trusted.** Anyone with root on the VPS can add their own
 key to the phone (it has a key for exactly that, used by `si add-client`),
-reach the phone as root, and read guest folders. Pick a VPS provider and
+reach the phone as root, and read guest folders and home folders. Pick a VPS provider and
 an admin login you trust, keep its SSH locked down, and treat a VPS you no
 longer control as a compromised phone: reinstall with `--purge`.
 
@@ -340,9 +414,10 @@ The test suite runs locally with no phone, VPS or network. It mocks the
 chroot, systemd, SSH and certbot, and covers install and uninstall,
 the generated boot scripts, clients, guests, several phones, VPS
 authorization, domains, identity export and import, and the Windows
-script (run under PowerShell only if `pwsh` is installed).
+tool (run under PowerShell only if `pwsh` is installed).
 `SERVERINATOR_TEST_REAL_GUESTS=1` (as root, with `sshd` available) also
-runs the guest chain end to end with two real sshd instances.
+runs both guest modes end to end with two real sshd instances. CI runs
+the suite, as a normal user and as root, and `shellcheck` on every push.
 
 `dev-env.example.sh` sets up DEV mode (`SERVERINATOR_DEV=1`), which
 points every path at `/tmp` so you can run the scripts on a normal Linux
@@ -354,34 +429,35 @@ Repository layout:
 
 ```
 serverinator.sh        installer, run on the phone; drives both sides
-core/core-phone.sh     phone side: chroot, keys, sshd, Magisk scripts
-core/core-vps.sh       VPS side: WireGuard, wstunnel, clients, guests, domains
+core/core-phone.sh     phone side: settings and the install steps, in order
+core/phone/            ...one file per feature: chroot, tunnel, sshd, guests, ...
+core/core-vps.sh       VPS side: settings, flags and the setup steps
+core/vps/              ...one file per feature: wireguard, wstunnel, tls, clients, guests, ...
+core/templates/        the files the scripts write (Magisk scripts, sshd and
+                       systemd config, the client setup script), with @MARKERS@
 core/vps-auth.sh       getting the phone's key onto the VPS
 core/guest-helper.sh   guest accounts and folders inside the chroot
 core/si                the si command (phone, chroot and VPS)
-core/lib.sh, motd.bash shared helpers and the login banner
-tests/                 local test suite
-tools/                 diagnostics
+core/lib.sh, motd.bash shared helpers and settings, and the login banner
+tests/                 local test suite (tests/fakes/ stands in for wg and downloads)
+tools/                 diagnostics, and the Windows client setup
 ```
 
 ## Limitations and roadmap
 
-- **No access level between guest and root.** A client is root on the
-  phone and a guest gets files only. A normal shell user without root
-  doesn't exist yet.
-- **No alert when the tunnel goes down.** The phone reconnects by itself
-  when WireGuard goes 5 minutes without a handshake, or when it moves
-  between mobile data and Wi-Fi, but nothing notifies you; `si status`
-  shows the state.
-- **Moving to a new VPS isn't a tested workflow.** Re-running the
-  installer against a new VPS should work, since the phone's keys don't
-  depend on the VPS, but it hasn't been tested end to end. With a
+- **No alert when the tunnel goes down, by design.** The phone reconnects
+  by itself when WireGuard goes 5 minutes without a handshake, or when it
+  moves between mobile data and Wi-Fi, but ServerInator doesn't depend on
+  an outside service to notify you; `si status` shows the state.
+- **Moving to a new VPS isn't a tested workflow yet (later).** Re-running
+  the installer against a new VPS should work, since the phone's keys
+  don't depend on the VPS, but it hasn't been tested end to end. With a
   domain, a move could become mostly a DNS change.
-- **Boot scripts wait by polling.** Each script checks its dependency
-  every couple of seconds up to a timeout and then carries on. It works,
-  but it is not event-driven.
-- **Install output is plain log lines.** A more visual progress display
-  would help during a multi-minute install.
+- **Boot scripts wait by polling (later).** Each script checks its
+  dependency every couple of seconds up to a timeout and then carries on.
+  It works, but it is not event-driven.
+- **The Windows client setup is untested.** `tools/client-setup-windows.ps1`
+  has only run under PowerShell on Linux so far.
 
 ## License
 
