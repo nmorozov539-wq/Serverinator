@@ -148,7 +148,7 @@ SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/u" SERVERINATOR_VPS_ADMIN_HOME="$
     bash -c 'source "$1"; _authorize_vps_jump_key "ssh-ed25519 AAAAJUMP1 a" 10.66.69.2 2222
         _authorize_vps_jump_key "ssh-ed25519 AAAAJUMP2 b" 10.66.69.3 2222' _ "$VPS_SCRIPT" > /dev/null 2>&1
 printf 'ssh-ed25519 AAAAMINE me@laptop\n' >> "$admin/.ssh/authorized_keys"
-SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/u" SERVERINATOR_VPS_ADMIN_HOME="$admin" bash "$VPS_SCRIPT" --uninstall > "$tmp/u.log" 2>&1
+SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/u" SERVERINATOR_VPS_ADMIN_HOME="$admin" bash "$VPS_SCRIPT" --uninstall --yes > "$tmp/u.log" 2>&1
 assert_eq 0 "$?" 'uninstall succeeds'
 assert_eq 'ssh-ed25519 AAAAMINE me@laptop' "$(cat "$admin/.ssh/authorized_keys")" 'only the jump entries are gone'
 assert_contains "$(cat "$tmp/u.log")" 'Removed ServerInator jump entries' 'reported'

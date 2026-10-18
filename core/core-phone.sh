@@ -3,6 +3,12 @@ set -euo pipefail
 
 # ─────────────────────────────────────────────
 # ServerInator Core — phone-side setup script
+#
+# serverinator.sh runs the setup; si runs the rest. As root on the phone:
+#   bash core-phone.sh --status | --report | --preflight
+#   bash core-phone.sh --start|--stop|--restart [wstunnel|wireguard|sshd]
+#   bash core-phone.sh --export-identity FILE | --import-identity FILE
+#   bash core-phone.sh --uninstall [--purge] [--yes]
 # ─────────────────────────────────────────────
 
 DEV="${SERVERINATOR_DEV:-0}"
@@ -24,6 +30,7 @@ BACK_HANDOFF_FILE=""
 DEVICE_NAME="${SERVERINATOR_DEVICE_NAME:-}"
 MODE="setup"
 PURGE=0
+SERVICE_NAME=""   # --start/--stop/--restart: one service, or all of them
 
 # /tmp inside the chroot: "tmpfs" (RAM, cleared on reboot) or "disk"
 # (persistent storage, old files removed by a periodic cleaner). Empty means
@@ -87,6 +94,8 @@ source "$CORE_DIR/lib.sh"
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help)  print_usage "$CORE_DIR/core-phone.sh"; exit 0 ;;
+            --version)  echo "ServerInator $SERVERINATOR_VERSION"; exit 0 ;;
             --device-name)
                 shift
                 [[ $# -gt 0 ]] || die "--device-name requires a value"
@@ -99,6 +108,12 @@ parse_args() {
                 ;;
             --uninstall) MODE="uninstall"; shift ;;
             --status)    MODE="status"; shift ;;
+            --preflight) MODE="preflight"; shift ;;
+            --report)    MODE="report"; shift ;;
+            --start|--stop|--restart)
+                MODE="${1#--}"; shift
+                if [[ $# -gt 0 && "$1" != -* ]]; then SERVICE_NAME="$1"; shift; fi
+                ;;
             --export-identity|--import-identity)
                 [[ "$1" == --export-identity ]] && MODE="export-identity" || MODE="import-identity"
                 shift
@@ -106,6 +121,7 @@ parse_args() {
                 IDENTITY_FILE="$1"; shift
                 ;;
             --purge)     PURGE=1; shift ;;
+            --yes)       ASSUME_YES=1; shift ;;
             --no-ssh)    ENABLE_SSH=0; shift ;;
             --chroot-tmp)
                 shift
@@ -974,6 +990,17 @@ route_dev() {
     esac
     printf '%s\\n' "\$route" | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n 1
 }
+# True when wstunnel has run 5 minutes and WireGuard still had no handshake
+# for 5 minutes (it renews every 2): the connection is dead in a way
+# wstunnel doesn't notice, like a network that silently drops it.
+STALE_AFTER=300
+handshake_stale() {
+    now_s=\$(date +%s)
+    [ \$((now_s - started)) -ge "\$STALE_AFTER" ] || return 1
+    hs=\$(chroot "\$CHROOT" /usr/bin/env -i PATH=/usr/bin:/bin wg show wg-si latest-handshakes 2>/dev/null | awk '{print \$2; exit}')
+    case "\$hs" in ''|*[!0-9]*) hs=0 ;; esac
+    [ \$((now_s - hs)) -ge "\$STALE_AFTER" ]
+}
 # Wait until the VPS is routable (network is up), up to 120s. Android keeps
 # its default route in per-network tables, not main, so "ip route show
 # default" stays empty and used to burn the full 120s on every boot.
@@ -1001,6 +1028,7 @@ ${verify_line}${prefix_line}        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VP
     # phone moves (mobile data at boot, then Wi-Fi), reconnect on the new
     # one: a network that blocks the tunnel would otherwise hold it forever.
     dev=\$(route_dev)
+    started=\$(date +%s); ticks=0
     while kill -0 "\$child" 2>/dev/null; do
         rotate_log || exit 1
         sleep 5
@@ -1009,6 +1037,13 @@ ${verify_line}${prefix_line}        -L "udp://${WG_LOCAL_PORT}:127.0.0.1:${WG_VP
         if [ -z "\$dev" ]; then dev="\$now"; continue; fi
         if [ "\$now" != "\$dev" ]; then
             printf '%s\\n' "network changed (\$dev -> \$now), reconnecting" >> "\$LOG"
+            kill "\$child" 2>/dev/null
+            break
+        fi
+        ticks=\$((ticks + 1))
+        [ \$((ticks % 6)) -eq 0 ] || continue
+        if handshake_stale; then
+            printf '%s\\n' "no handshake for \$((now_s - hs))s, reconnecting" >> "\$LOG"
             kill "\$child" 2>/dev/null
             break
         fi
@@ -1486,9 +1521,33 @@ stop_exact_pid() {
     fi
     kill -KILL "$pid" || die "Cannot kill remaining managed process"
 }
+# What --uninstall is about to delete, so the question means something.
+uninstall_summary() {
+    local size="" f
+    echo ""
+    echo "  This removes ServerInator Core from this phone:"
+    if [[ -d "$CHROOT" ]]; then
+        size="$(du -sxh "$CHROOT" 2>/dev/null | awk '{print $1}')" || size=""
+        echo "    - the Linux system in $CHROOT${size:+ ($size)}, with everything in it:"
+        echo "      your files in /root, shared folders and add-on data in /srv"
+    fi
+    for f in "$MAGISK_SERVICE_D"/[0-9][0-9]-serverinator-*.sh; do
+        [[ -e "$f" ]] && { echo "    - the boot scripts in $MAGISK_SERVICE_D and the si command"; break; }
+    done
+    if [[ "$PURGE" == 1 ]]; then
+        echo "    - this phone's identity (WireGuard key, SSH host keys): the VPS and"
+        echo "      every client will see a new phone after a reinstall"
+    else
+        echo "  Kept: this phone's WireGuard key and SSH host keys (--purge deletes them)."
+    fi
+    echo ""
+}
+
 uninstall_phone() {
     check_root
     safe_remove_path "$CHROOT"
+    uninstall_summary
+    confirm_destructive "Remove it?"
     safe_remove_path "$SSH_HOSTKEY_DIR"
     safe_remove_path "$IDENTITY_DIR"
     local name file pid proc script
@@ -1567,6 +1626,188 @@ uninstall_phone() {
     info "Phone uninstall complete; WireGuard and SSH host keys kept unless --purge"
 }
 
+# ── Preflight and report ──────────────────────
+
+# Facts about this phone, as KEY=VALUE lines (for the preflight and si report).
+phone_facts() {
+    local prop
+    prop() { getprop "$1" 2>/dev/null || true; }
+    echo "model=$(prop ro.product.manufacturer) $(prop ro.product.model) ($(prop ro.product.device))"
+    echo "android=$(prop ro.build.version.release)"
+    echo "rom=$(prop ro.build.display.id)"
+    echo "kernel=$(uname -r)"
+    echo "arch=$(uname -m)"
+    echo "ram_mb=$(awk '$1=="MemTotal:" {print int($2/1024)}' /proc/meminfo 2>/dev/null)"
+    echo "magisk=$( { magisk -v 2>/dev/null || echo none; } | head -n 1)"
+    echo "uptime_days=$(awk '{printf "%.1f", $1/86400}' /proc/uptime 2>/dev/null)"
+}
+
+# Can the kernel make a WireGuard interface? Everything depends on it, and
+# the install downloads hundreds of MB before it would find out.
+kernel_has_wireguard() {
+    local name="si-wgtest"
+    ip link del "$name" 2>/dev/null || true
+    ip link add "$name" type wireguard 2>/dev/null || return 1
+    ip link del "$name" 2>/dev/null || true
+}
+
+# Checks what the install needs before it starts; dies with the reason.
+phone_preflight() {
+    check_root
+    check_magisk
+    local facts kb bad=0
+    facts="$(phone_facts)"
+    _fact() { sed -n "s/^$1=//p" <<< "$facts"; }
+    info "Phone: $(_fact model), Android $(_fact android)"
+    info "Kernel $(_fact kernel) ($(_fact arch)), $(_fact ram_mb) MB RAM, Magisk $(_fact magisk)"
+    detect_arch > /dev/null
+    if [[ "$DEV" == 1 ]]; then
+        dev "DEV: not testing kernel WireGuard"
+    elif kernel_has_wireguard; then
+        ok "The kernel supports WireGuard"
+    else
+        fail "This kernel can't make a WireGuard interface (ip link add ... type wireguard failed)."
+        echo "  ServerInator needs WireGuard in the kernel: built in (5.6 and newer), or"
+        echo "  backported by the ROM (many custom kernels have it). Userspace WireGuard"
+        echo "  isn't supported."
+        bad=1
+    fi
+    check_disk_space
+    if (( $(_fact ram_mb) < 2048 )); then
+        warn "Less than 2 GB of RAM: Core runs, but Personal's services may not fit"
+    fi
+    ((bad == 0)) || die "This phone can't run ServerInator (see above)"
+}
+
+# One paste-able line about this phone and its install, for bug reports.
+phone_report() {
+    local facts state="not installed" hs
+    facts="$(phone_facts)"
+    _fact() { sed -n "s/^$1=//p" <<< "$facts"; }
+    if [[ -f "$CHROOT/etc/wireguard/wg-si.conf" ]]; then
+        state="installed"
+        hs="$(chroot_run wg show wg-si latest-handshakes 2>/dev/null | awk '{print $2; exit}')" || hs=""
+        if [[ "$hs" =~ ^[0-9]+$ && "$hs" -gt 0 ]]; then state+=", handshake $(( $(date +%s) - hs ))s ago"
+        else state+=", no handshake"; fi
+    fi
+    printf '%s | Android %s | %s | kernel %s %s | %s MB RAM | Magisk %s | up %s days | ServerInator: %s\n' \
+        "$(_fact model)" "$(_fact android)" "$(_fact rom)" "$(_fact kernel)" "$(_fact arch)" \
+        "$(_fact ram_mb)" "$(_fact magisk)" "$(_fact uptime_days)" "$state"
+}
+
+# ── Start / stop (si start|stop|restart) ──────
+
+# NAME -> "SCRIPT CHILD_PIDFILE" (the child pid file is empty for wireguard,
+# whose supervisor runs short commands). Order: the order they start in.
+CONTROL_SERVICES="wstunnel wireguard sshd tmpclean"
+service_parts() { # NAME
+    case "$1" in
+        wstunnel)  echo "$MAGISK_SERVICE_D/10-serverinator-wstunnel.sh wstunnel.pid" ;;
+        wireguard) echo "$MAGISK_SERVICE_D/20-serverinator-wireguard.sh -" ;;
+        sshd)      echo "$MAGISK_SERVICE_D/30-serverinator-sshd.sh sshd.pid" ;;
+        tmpclean)  echo "$MAGISK_SERVICE_D/40-serverinator-tmpclean.sh -" ;;
+        *) die "Unknown service: $1 (one of: $CONTROL_SERVICES)" ;;
+    esac
+}
+
+stop_service() { # NAME
+    local script child pid root
+    read -r script child <<< "$(service_parts "$1")"
+    if status_pid_alive "$STATE_DIR/run/$1-supervisor.pid"; then
+        read -r pid < "$STATE_DIR/run/$1-supervisor.pid"
+        # A supervisor that died leaves its pid file behind, and Android
+        # reuses pids fast: then it's not ours, and nothing is killed. (Seen
+        # on rn9p: a restart stopped at such a file and left sshd down.)
+        if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -Fxq -e "$script" -e "${script}.bak"; then
+            stop_exact_pid "$pid" "$script" supervisor
+        else
+            warn "$1: its pid file is stale (pid $pid is something else now); left that alone"
+        fi
+    fi
+    # The supervisor stops its child on TERM, but a KILL skips that.
+    if [[ "$child" != - ]] && status_pid_alive "$STATE_DIR/run/$child"; then
+        read -r pid < "$STATE_DIR/run/$child"
+        root="$(readlink "/proc/$pid/root" 2>/dev/null)" || root=""
+        if [[ "$root" == "$CHROOT" ]]; then stop_exact_pid "$pid" "$CHROOT" child; fi
+    fi
+    rm -f "$STATE_DIR/run/$1-supervisor.pid"
+    [[ "$child" == - ]] || rm -f "$STATE_DIR/run/$child"
+}
+
+start_service() { # NAME -> 0 started, 1 already running, 2 not installed
+    local script child
+    read -r script child <<< "$(service_parts "$1")"
+    [[ -f "$script" ]] || return 2
+    status_pid_alive "$STATE_DIR/run/$1-supervisor.pid" && return 1
+    # Detached like Magisk does at boot, so it outlives this shell.
+    if have_cmd setsid; then
+        setsid sh "$script" < /dev/null > /dev/null 2>&1 &
+    else
+        nohup sh "$script" < /dev/null > /dev/null 2>&1 &
+    fi
+    return 0
+}
+
+# What a reboot did: (re)start the boot scripts, without the reboot.
+control_services() { # start|stop|restart [NAME]
+    local action="$1" names="${2:-$CONTROL_SERVICES}" name rc script _
+    check_root
+    [[ -f "$CHROOT/etc/wireguard/wg-si.conf" ]] || die "Core is not installed on this phone"
+    for name in $names; do service_parts "$name" > /dev/null; done
+    if [[ "$action" != start ]]; then
+        local reversed=""
+        for name in $names; do reversed="$name $reversed"; done
+        for name in $reversed; do
+            read -r script _ <<< "$(service_parts "$name")"
+            [[ -f "$script" || -n "${2:-}" ]] || continue
+            stop_service "$name"; info "$name stopped"
+        done
+    fi
+    [[ "$action" != stop ]] || return 0
+    sh "$MAGISK_SERVICE_D/00-serverinator-mount.sh" || die "The chroot mount script failed"
+    for name in $names; do
+        rc=0; start_service "$name" || rc=$?
+        case "$rc" in
+            0) ok "$name started" ;;
+            1) info "$name was already running" ;;
+            2) [[ -n "${2:-}" ]] && warn "$name isn't installed" ;;
+        esac
+    done
+    echo "  The tunnel comes up within seconds once the network is there: si status"
+}
+
+# ── Phone health (si status) ──────────────────
+
+# Battery, heat and space: a phone that serves for months mostly dies of
+# heat or a battery held at 100%. Warnings only; they don't fail si status.
+POWER_SUPPLY_DIR="${SERVERINATOR_POWER_SUPPLY_DIR:-/sys/class/power_supply}"
+phone_health() {
+    local d cap="" status="" temp="" pct line
+    for d in "$POWER_SUPPLY_DIR/battery" "$POWER_SUPPLY_DIR/Battery"; do
+        # -e, not -r: Android's bash can deny root an access() check.
+        [[ -e "$d/capacity" ]] || continue
+        read -r cap < "$d/capacity" || cap=""
+        [[ -e "$d/status" ]] && { read -r status < "$d/status" || status=""; }
+        [[ -e "$d/temp" ]] && { read -r temp < "$d/temp" || temp=""; }
+        break
+    done
+    if [[ "$cap" =~ ^[0-9]+$ ]]; then
+        line="Battery ${cap}%${status:+, ${status,,}}"
+        [[ "$temp" =~ ^[0-9]+$ ]] && line+=", $((temp / 10)).$((temp % 10))°C"
+        info "$line"
+        if [[ "$temp" =~ ^[0-9]+$ ]] && (( temp >= 420 )); then
+            warn "The battery is hot ($((temp / 10))°C): let it cool, or lower the load"
+        fi
+        if [[ "$cap" == 100 && "${status,,}" =~ ^(full|charging)$ ]]; then
+            warn "The battery is held at 100%: a charge limit (ROM setting or a Magisk module) is kinder to it"
+        fi
+    fi
+    pct="$(df -P /data 2>/dev/null | awk 'NR==2 {sub("%", "", $5); print $5}')"
+    if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 90 )); then
+        warn "/data is ${pct}% full"
+    fi
+}
+
 # ── Status (si status) ────────────────────────
 
 # One look at everything the tunnel needs, for debugging without the VPS:
@@ -1585,8 +1826,13 @@ phone_status() {
         fail "Core is not installed on this phone ($conf is missing)"
         return 1
     fi
+    local script _ pid
     for name in wstunnel wireguard sshd; do
-        if status_pid_alive "$STATE_DIR/run/$name-supervisor.pid"; then
+        read -r script _ <<< "$(service_parts "$name")"
+        pid=""; [[ -f "$STATE_DIR/run/$name-supervisor.pid" ]] && read -r pid < "$STATE_DIR/run/$name-supervisor.pid"
+        # Alive and really ours: a pid file can outlive its process.
+        if status_pid_alive "$STATE_DIR/run/$name-supervisor.pid" \
+                && tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -Fxq -e "$script" -e "${script}.bak"; then
             ok "$name supervisor is running"
         else
             fail "$name supervisor is not running"; bad=1
@@ -1621,6 +1867,7 @@ phone_status() {
     else
         fail "No answer from the VPS through the tunnel (${vps_ip:-?})"; bad=1
     fi
+    phone_health
     echo ""
     if [[ "$bad" == 0 ]]; then
         echo "  All good. Logs: si logs"
@@ -1848,6 +2095,9 @@ main() {
     parse_args "$@"
     if [[ "$MODE" == uninstall ]]; then uninstall_phone; return; fi
     if [[ "$MODE" == status ]]; then phone_status; return; fi
+    if [[ "$MODE" == preflight ]]; then phone_preflight; return; fi
+    if [[ "$MODE" == report ]]; then phone_report; return; fi
+    case "$MODE" in start|stop|restart) control_services "$MODE" "$SERVICE_NAME"; return ;; esac
     if [[ "$MODE" == export-identity ]]; then export_identity "$IDENTITY_FILE"; return; fi
     if [[ "$MODE" == import-identity ]]; then import_identity "$IDENTITY_FILE"; return; fi
     [[ "$PURGE" == 0 ]] || die "--purge requires --uninstall"

@@ -220,7 +220,7 @@ printf '%s\n' "$foreign" >> "$root/runtime.rules"
 printf '%s\n' '-A OUTPUT -p tcp -m tcp --sport 9443 --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500' >> "$IPTABLES_RULES_PATH"
 # Uninstall must use recorded ports, not today's override, even with SKIP set.
 WSTUNNEL_PORT=9443 SERVERINATOR_SKIP_MSS=1
-uninstall_vps
+ASSUME_YES=1 uninstall_vps
 [[ $(cat "$root/runtime.rules") == "$foreign" ]] || exit 34
 [[ $(cat "$SERVERINATOR_IPTABLES_RULES_PATH") != *serverinator-mss* ]] || exit 35
 grep -Fxq -- '-A OUTPUT -p tcp -m tcp --sport 9443 --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500' "$IPTABLES_RULES_PATH" || exit 38
@@ -229,7 +229,7 @@ WSTUNNEL_PORT=9443 SERVERINATOR_SKIP_MSS=0
 fix_pmtu_clamp
 [[ $(cat "$root/runtime.rules") == "$foreign" ]] || exit 36
 before=$(wc -l < "$root/iptables.calls")
-uninstall_vps
+ASSUME_YES=1 uninstall_vps
 [[ $(wc -l < "$root/iptables.calls") == "$before" ]] || exit 37
 MOCK
 assert_eq 0 "$rc" 'default/explicit skip makes no firewall calls; uninstall removes only recorded owned rule'

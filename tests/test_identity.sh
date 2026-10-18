@@ -146,9 +146,9 @@ rc=0; phone "$tmp/fresh-dd" --import-identity "$tmp/bad/dotdot.tar" > /dev/null 
 assert_eq 1 "$rc" 'refused: path outside the archive'
 
 echo "Test: uninstall keeps the identity; --purge removes it"
-phone "$new" --uninstall > /dev/null 2>&1
+phone "$new" --uninstall --yes > /dev/null 2>&1
 assert_file_exists "$new/state/identity/wireguard/client.key" 'kept by a plain uninstall'
-phone "$new" --uninstall --purge > /dev/null 2>&1
+phone "$new" --uninstall --purge --yes > /dev/null 2>&1
 assert_file_missing "$new/state/identity" 'removed by --purge'
 
 echo "Test: the installer offers the saved device name"

@@ -140,7 +140,10 @@ validate_tunnel_port "$WSTUNNEL_PORT"
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help)  print_usage "$CORE_DIR/core-vps.sh"; exit 0 ;;
+            --version)  echo "ServerInator $SERVERINATOR_VERSION"; exit 0 ;;
             --uninstall) MODE="uninstall"; shift ;;
+            --yes)       ASSUME_YES=1; shift ;;
             --verify)
                 MODE="verify"; shift
                 # Optional file; without it the device record is used.
@@ -2817,6 +2820,17 @@ _remove_all_vps_jump_entries() {
 
 uninstall_vps() {
     safe_remove_path "$WG_KEY_DIR"
+    local phones clients=0 guests=0 f
+    phones="$(device_names 2>/dev/null | tr '\n' ' ')"
+    for f in "$SSH_KEY_DIR"/owner_*.pub; do [[ -f "$f" ]] && clients=$((clients + 1)); done
+    for f in "$GUESTS_DIR"/*.json; do [[ -f "$f" ]] && guests=$((guests + 1)); done
+    echo ""
+    echo "  This removes ServerInator from this VPS: the tunnel (wstunnel, WireGuard),"
+    echo "  ${phones:+the phones ${phones}and }${clients} client key(s), ${guests} guest(s), and its firewall rules."
+    echo "  Phones lose the tunnel until they are set up again, and every client needs"
+    echo "  a new setup script. Other services and your own SSH keys stay."
+    echo ""
+    confirm_destructive "Remove it?"
     local svc="$SYSTEMD_DIR/wstunnel-serverinator.service"
     if [[ "$DEV" != 1 ]]; then
         [[ "$(id -u)" == 0 ]] || die "VPS uninstall requires root"

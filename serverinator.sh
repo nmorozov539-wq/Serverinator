@@ -139,6 +139,8 @@ vps_pull() {
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -h|--help)  print_usage "${BASH_SOURCE[0]}"; exit 0 ;;
+            --version)  echo "ServerInator $SERVERINATOR_VERSION"; exit 0 ;;
             --vps)
                 shift; [[ $# -gt 0 ]] || die "--vps requires a value: user@host"
                 VPS_TARGET="$1"; shift ;;
@@ -609,16 +611,27 @@ run_set_domain() {
 
     step_apply_back_handoff 2/4 3/4
     step_wss_preflight 4/4 || true
+    restart_tunnel
 
     echo ""
     if [[ "$REMOVE_DOMAIN" == 1 ]]; then
-        ok "Done (took $(elapsed)). After a reboot this phone connects to $VPS_HOST by IP."
+        ok "Done (took $(elapsed)). This phone now connects to $VPS_HOST by IP."
     else
-        ok "Done (took $(elapsed)). After a reboot this phone connects to $DOMAIN."
+        ok "Done (took $(elapsed)). This phone now connects to $DOMAIN."
     fi
     echo "  Other phones on this VPS keep working by IP until you run the same"
     echo "  command on each of them."
     echo ""
+}
+
+# Restarts the tunnel's services with the new config, as a reboot used to
+# (core-phone.sh --restart). Personal's services are left running.
+restart_tunnel() {
+    if [[ "$DEV" == 1 ]]; then dev "DEV: not restarting the tunnel"; return 0; fi
+    echo ""
+    info "Starting the tunnel with the new settings (no reboot needed)"
+    bash "$SCRIPT_DIR/core/core-phone.sh" --restart \
+        || warn "Could not restart the tunnel here; reboot the phone instead"
 }
 
 # ─────────────────────────────────────────────
@@ -645,6 +658,11 @@ main() {
         return 0
     fi
 
+    # Before any question or download: can this phone run it at all?
+    if [[ "$DEV" != 1 ]]; then
+        section 0/5 "Checking this phone"
+        bash "$SCRIPT_DIR/core/core-phone.sh" --preflight
+    fi
     ask_questions
     SECONDS=0   # time the install itself, not the questions
     check_prereqs
@@ -653,6 +671,7 @@ main() {
     step_vps_setup
     step_apply_back_handoff
     step_wss_preflight || true   # don't stop just because the WSS test failed
+    restart_tunnel
 
     # ── Summary ──────────────────────────────────
     echo ""
@@ -660,7 +679,8 @@ main() {
     echo "${C_GREEN}${C_BOLD}  Setup complete!${C_RESET} (took $(elapsed))"
     echo "${C_GREEN}══════════════════════════════════════════════${C_RESET}"
     echo ""
-    echo "  Reboot the phone — services will come up automatically via Magisk."
+    echo "  The tunnel is running; after a reboot Magisk starts it by itself."
+    echo "  (The si command itself appears in /system/bin after the first reboot.)"
     echo ""
     local domain
     domain="$(back_handoff_domain 2>/dev/null)" || domain=""
@@ -668,7 +688,7 @@ main() {
         echo "  Tunnel: wss://${domain} with a real certificate (renewed automatically)"
         echo ""
     fi
-    echo "  After rebooting — check the tunnel (on the phone, as root):"
+    echo "  Check the tunnel (on the phone, as root):"
     echo "    si status        this phone's side"
     echo "    si verify        end to end, from the VPS"
     echo "  si help lists the rest; on the VPS, si works the same way."

@@ -50,12 +50,16 @@ si — ServerInator Core on this phone
 
   si status                     is the tunnel up? (supervisors, handshake, ping)
   si logs [NAME] [-n LINES]     last log lines (wstunnel, wireguard, sshd, ...)
+  si report                     one line about this phone, for bug reports
+  si version                    the ServerInator release
+  si start|stop|restart [NAME]  the tunnel's services, no reboot needed
+                                (wstunnel, wireguard, sshd; all when no NAME)
   si setup [OPTIONS]            re-run serverinator.sh against the saved VPS
   si set-domain DOMAIN [--acme-email EMAIL]
   si remove-domain              back to the VPS's IP and self-signed certificate
   si export-identity FILE       keys and name, to move to another phone
   si import-identity FILE       on the new phone, before si setup
-  si uninstall [--purge]        remove Core from this phone
+  si uninstall [--purge] [--yes]   remove Core from this phone (asks first)
 
 On the VPS, through SSH (this phone's device is filled in):
   si verify | si clients | si revoke-client LABEL
@@ -92,7 +96,7 @@ si — ServerInator Core on the VPS (runs core-vps.sh)
   si revoke-guest NAME
   si sync-guests                after a phone reset
   si remove-device NAME
-  si uninstall                  remove Core from this VPS
+  si uninstall [--yes]          remove Core from this VPS (asks first)
 
 With several phones, add --device NAME. Any core-vps.sh flag works too,
 like si --set-domain DOMAIN.
@@ -159,10 +163,15 @@ run_phone() {
     [[ $# -gt 0 ]] && shift
     case "$cmd" in
         help|-h|--help) usage; return 0 ;;
+        version|--version) echo "ServerInator $SERVERINATOR_VERSION"; return 0 ;;
     esac
     [[ "$(id -u)" == 0 ]] || die "Run as root (su)"
     case "$cmd" in
         status)          exec bash "$SI_DIR/core-phone.sh" --status "$@" ;;
+        report)          exec bash "$SI_DIR/core-phone.sh" --report ;;
+        start|stop|restart)
+            [[ $# -le 1 ]] || die "Use: si $cmd [NAME]"
+            exec bash "$SI_DIR/core-phone.sh" "--$cmd" "$@" ;;
         logs)            phone_logs "$@" ;;
         export-identity|import-identity)
             [[ $# -eq 1 ]] || die "Use: si $cmd FILE"
@@ -235,6 +244,7 @@ chroot_status() {
 run_chroot() {
     case "${1:-help}" in
         help|-h|--help) usage ;;
+        version|--version) echo "ServerInator $SERVERINATOR_VERSION" ;;
         status) chroot_status ;;
         *) die "Unknown command: $1. Inside the chroot only 'si status' works; the rest runs on the Android side." ;;
     esac
@@ -247,6 +257,7 @@ run_vps() {
     [[ $# -gt 0 ]] && shift
     case "$cmd" in
         help|-h|--help) usage; return 0 ;;
+        version|--version) echo "ServerInator $SERVERINATOR_VERSION"; return 0 ;;
         uninstall) flag="--uninstall" ;;
         -*) exec bash "$SI_DIR/core-vps.sh" "$cmd" "$@" ;;
         *)

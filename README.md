@@ -54,7 +54,9 @@ Your laptop (or any client) only needs an OpenSSH client.
 1. **Copy this repo onto the phone** (`git clone` in Termux, or
    `adb push`) and open a root shell in it.
 
-2. **Run the installer:**
+2. **Run the installer.** It first checks the phone (Magisk, CPU type,
+   free space, RAM, and whether the kernel can make a WireGuard
+   interface) and stops with the reason if something is missing:
 
    ```
    bash serverinator.sh
@@ -80,11 +82,11 @@ Your laptop (or any client) only needs an OpenSSH client.
    `bash serverinator.sh --authorize-vps user@host`.
 
    The installer then sets up the chroot, the VPS side and the tunnel
-   config, and finishes with a test connection.
+   config, finishes with a test connection, and starts the tunnel. No
+   reboot is needed; after one, Magisk starts it by itself.
 
-4. **Reboot the phone.** The install only writes the autostart scripts;
-   Magisk runs them at boot, along with the `si` command (see below).
-   The tunnel usually comes up within seconds of the network.
+4. **The `si` command** (see below) appears in `/system/bin` after the
+   first reboot. Until then, run it as `sh /data/adb/modules/serverinator/system/bin/si`.
 
 5. **Check the tunnel.** On the phone, as root:
 
@@ -129,7 +131,7 @@ when a later step fails. `si help` lists what works where.
 
 | Where | How you get there | What it does |
 |---|---|---|
-| Phone (Android side) | `su` in Termux, or `adb shell su` | everything: `si status`, `si logs`, `si setup`, `si set-domain`, `si export-identity`, `si uninstall`, plus the VPS commands below, which it runs on the VPS for you |
+| Phone (Android side) | `su` in Termux, or `adb shell su` | everything: `si status`, `si logs`, `si start/stop/restart`, `si setup`, `si set-domain`, `si export-identity`, `si report`, `si uninstall`, plus the VPS commands below, which it runs on the VPS for you |
 | Phone (inside the chroot) | `ssh PHONE-ALIAS` | `si status` |
 | VPS | any root or sudo login | `si verify`, `si devices`, `si add-client`, guests, `si uninstall` |
 
@@ -141,7 +143,12 @@ the installer from can go. The phone remembers its VPS and its name, so
 `si add-client LABEL` on the phone adds the client for this phone.
 
 `si logs [NAME] [-n LINES]` shows the last lines of the tunnel's logs
-(wstunnel, wireguard, sshd). Every `si` command is a shortcut: the long
+(wstunnel, wireguard, sshd). `si restart [NAME]` (also `start`, `stop`)
+restarts the tunnel's services without a reboot. `si status` and the login
+banner also show the battery and warn about heat, a battery kept at 100%
+while plugged in, and a nearly full disk. `si report` prints one line about
+the phone and the install to paste into a bug report; `si version` the
+release. Every `si` command is a shortcut: the long
 flags of `serverinator.sh`, `core-phone.sh` and `core-vps.sh` work as
 before, and `si vps --any-flag` passes a flag straight to `core-vps.sh`.
 
@@ -263,10 +270,12 @@ The file contains private keys, so treat it like a password.
 
 On the phone, this removes the chroot, the autostart scripts and the `si`
 command. The phone's WireGuard and SSH host keys are kept so a reinstall
-keeps the same identity; `--purge` deletes them too.
+keeps the same identity; `--purge` deletes them too. It lists what it will
+delete (the chroot with its size) and asks first; `--yes` answers for
+scripts.
 
 ```
-si uninstall [--purge]
+si uninstall [--purge] [--yes]
 ```
 
 On the VPS, this removes ServerInator's services, config, client keys,
@@ -360,9 +369,10 @@ tools/                 diagnostics
 - **No access level between guest and root.** A client is root on the
   phone and a guest gets files only. A normal shell user without root
   doesn't exist yet.
-- **No alert when the tunnel goes down.** You find out by trying to
-  connect, or with `si status`. A watchdog that sends a notification on a
-  missed handshake would fix this.
+- **No alert when the tunnel goes down.** The phone reconnects by itself
+  when WireGuard goes 5 minutes without a handshake, or when it moves
+  between mobile data and Wi-Fi, but nothing notifies you; `si status`
+  shows the state.
 - **Moving to a new VPS isn't a tested workflow.** Re-running the
   installer against a new VPS should work, since the phone's keys don't
   depend on the VPS, but it hasn't been tested end to end. With a

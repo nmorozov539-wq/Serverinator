@@ -51,6 +51,10 @@ assert_contains "$(si phone devices)" 'ssh-cmd /usr/local/bin/si devices' 'phone
 assert_contains "$(si phone add-guest 'a b')" "si add-guest a\\ b --device rn9p" 'phone: arguments are quoted for the remote shell'
 assert_contains "$(si phone vps --list-clients)" 'ssh-cmd /usr/local/bin/si --list-clients' 'phone: si vps forwards anything'
 assert_eq "core-phone.sh --status" "$(si phone status)" 'phone: status'
+assert_eq "core-phone.sh --restart" "$(si phone restart)" 'phone: restart'
+assert_eq "core-phone.sh --stop wstunnel" "$(si phone stop wstunnel)" 'phone: stop one service'
+rc=0; si phone start a b > /dev/null || rc=$?
+assert_eq 1 "$rc" 'phone: start takes one name at most'
 assert_eq "core-phone.sh --uninstall --purge" "$(si phone uninstall --purge)" 'phone: uninstall passes --purge'
 assert_eq "core-phone.sh --export-identity /sdcard/x.tar" "$(si phone export-identity /sdcard/x.tar)" 'phone: export-identity'
 assert_eq "serverinator.sh --vps root@1.2.3.4 --chroot-tmp disk" "$(si phone setup --chroot-tmp disk)" 'phone: setup uses the saved VPS'
@@ -125,25 +129,25 @@ unset SERVERINATOR_STATE_DIR
 export SERVERINATOR_CHROOT="$tmp/phone/root" SERVERINATOR_SERVICE_D="$tmp/phone/service" \
     SERVERINATOR_STATE_DIR="$istate" SERVERINATOR_SSH_HOSTKEY_DIR="$tmp/phone/hostkeys"
 mkdir -p "$SERVERINATOR_CHROOT" "$SERVERINATOR_SERVICE_D" "$tmp/modules/serverinator-extra" "$tmp/modules/other"
-rc=0; bash "$PHONE_SCRIPT" --uninstall > "$tmp/out" 2>&1 || rc=$?
+rc=0; bash "$PHONE_SCRIPT" --uninstall --yes > "$tmp/out" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'uninstall succeeds'
 assert_file_missing "$tmp/modules/serverinator" 'uninstall removes the si module'
 assert_file_missing "$tmp/modules/serverinator-extra" 'uninstall removes modules built on Core'
 assert_eq 1 "$([[ -d "$tmp/modules/other" ]] && echo 1)" 'uninstall leaves other modules'
 assert_file_missing "$istate/bin" 'uninstall removes the scripts'
 assert_file_exists "$istate/vps-target" 'plain uninstall keeps the saved VPS'
-rc=0; bash "$PHONE_SCRIPT" --uninstall --purge > "$tmp/out" 2>&1 || rc=$?
+rc=0; bash "$PHONE_SCRIPT" --uninstall --purge --yes > "$tmp/out" 2>&1 || rc=$?
 assert_file_missing "$istate/vps-target" 'purge forgets the VPS'
 
 # ── VPS uninstall removes its launcher, only if ours ──
 export SERVERINATOR_DEV_ROOT="$tmp/vps" SERVERINATOR_SI_LAUNCHER="$tmp/vps/usr/local/bin/si"
 mkdir -p "$tmp/vps/etc/wireguard/serverinator" "$tmp/vps/usr/local/bin"
 printf '#!/bin/sh\necho someone else\n' > "$SERVERINATOR_SI_LAUNCHER"
-bash "$VPS_SCRIPT" --uninstall > /dev/null 2>&1
+bash "$VPS_SCRIPT" --uninstall --yes > /dev/null 2>&1
 assert_file_exists "$SERVERINATOR_SI_LAUNCHER" 'VPS uninstall keeps a foreign si'
 mkdir -p "$tmp/vps/etc/wireguard/serverinator"
 printf '#!/bin/sh\n# ServerInator: the si command (managed). Needs root.\n' > "$SERVERINATOR_SI_LAUNCHER"
-bash "$VPS_SCRIPT" --uninstall > /dev/null 2>&1
+bash "$VPS_SCRIPT" --uninstall --yes > /dev/null 2>&1
 assert_file_missing "$SERVERINATOR_SI_LAUNCHER" 'VPS uninstall removes our si'
 
 exit "$TESTS_FAILED"

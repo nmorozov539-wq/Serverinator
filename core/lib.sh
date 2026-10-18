@@ -22,6 +22,15 @@ done
 export PATH
 unset _si_dir
 
+# The release, shown by --version and si version. Bumped with each one.
+SERVERINATOR_VERSION="2026.10.18"
+
+# print_usage SCRIPT: the comment block at the top of SCRIPT (between the
+# first two ─── rules), without the leading "# ".
+print_usage() {
+    awk '/^# ─/ {n++; next} n == 1 {sub(/^# ?/, ""); print} n >= 2 {exit}' "$1"
+}
+
 # ── Logging ────────────────────────────────────
 #
 # Tags stay plain text ("[INFO]", "[ERROR]", ...) so logs remain greppable;
@@ -78,6 +87,17 @@ elapsed() {
 # ── Utilities ──────────────────────────────────
 
 have_cmd()    { command -v "$1" &>/dev/null; }
+
+# confirm_destructive QUESTION: asks [y/N] before deleting things; --yes
+# (ASSUME_YES=1) answers for scripts. Without a terminal it refuses rather
+# than guess.
+confirm_destructive() {
+    [[ "${ASSUME_YES:-0}" == 1 ]] && return 0
+    [[ -t 0 ]] || die "This deletes data, so it asks first; pass --yes to run it without a terminal"
+    local answer=""
+    read -r -p "  $1 [y/N] " answer || answer=""
+    [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || die "Nothing was changed"
+}
 
 # For `read ... || no_answer QUESTION [HINT]`: the input ended (no terminal,
 # or a pipe that ran out) before the answer. Without it, set -e quits silently.

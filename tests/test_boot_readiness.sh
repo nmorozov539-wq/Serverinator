@@ -91,6 +91,23 @@ out="$(sh "$tmp/watchrun.sh" 2>&1)"; rc=$?
 assert_eq 3 "$rc" 'same network: wstunnel keeps running'
 assert_file_missing "$tmp/killed" 'same network: nothing stopped'
 
+# The watchdog: no handshake for 5 minutes after 5 minutes up -> reconnect.
+sed -n '/^STALE_AFTER=/,/^}$/p' "$script" > "$tmp/stale.sh"
+stale() { # STARTED_AGO HANDSHAKE_AGO|never -> 0 stale, 1 fine
+    cat > "$tmp/stalerun.sh" <<RUN
+now=\$(date +%s); started=\$((now - $1)); CHROOT=/x
+chroot() { [ "$2" = never ] && return 0; printf 'KEY\t%s\n' \$((now - $2)); }
+. "$tmp/stale.sh"
+handshake_stale
+RUN
+    sh "$tmp/stalerun.sh"
+}
+stale 600 400; assert_eq 0 "$?" 'watchdog: 400s without a handshake is stale'
+stale 600 60;  assert_eq 1 "$?" 'watchdog: a fresh handshake is fine'
+stale 100 never; assert_eq 1 "$?" 'watchdog: not in the first 5 minutes'
+stale 600 never; assert_eq 0 "$?" 'watchdog: never shaking hands is stale'
+assert_contains "$content" 'no handshake for' 'watchdog logs why it reconnects'
+
 # A VPS given by name can't be routed before DNS works; probe a public address.
 make_back vps.example.com; apply_back_handoff > "$tmp/out" 2>&1
 assert_contains "$(cat "$script")" 'ip route get 1.1.1.1' 'hostname VPS: probes a public address'

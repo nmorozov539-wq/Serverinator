@@ -5,7 +5,7 @@
 # chroot-on-Android. Silence it with ~/.hushlogin or SI_MOTD=0.
 __si_motd() {
     local device="$1" k v c d fs size used mnt up mt=0 ma=0 load1 load5 load15
-    local cap="" status="" temp="" ws=0 sshd=0 wg=0 df_out="" disk="?" tmp="?"
+    local cap="" status="" temp="" ws=0 sshd=0 wg=0 df_out="" disk="?" tmp="?" disk_pct=0 notes=""
     local b="" r="" g="" y=""
     [[ -e "${HOME:-/root}/.hushlogin" || "${SI_MOTD:-1}" == 0 ]] && return 0
     if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
@@ -18,7 +18,7 @@ __si_motd() {
     while read -r k v _; do
         case $k in MemTotal:) mt=$v ;; MemAvailable:) ma=$v; break ;; esac
     done < /proc/meminfo
-    for d in /sys/class/power_supply/battery /sys/class/power_supply/Battery; do
+    for d in "${SI_POWER_SUPPLY_DIR:-/sys/class/power_supply}"/{battery,Battery}; do
         [[ -r $d/capacity ]] || continue
         read -r cap < "$d/capacity"
         [[ -r $d/status ]] && read -r status < "$d/status"
@@ -26,7 +26,7 @@ __si_motd() {
         break
     done
     for c in /proc/[0-9]*/comm; do
-        read -r k < "$c" 2>/dev/null || continue
+        { read -r k < "$c"; } 2>/dev/null || continue   # a process can end meanwhile
         case $k in wstunnel) ws=1 ;; sshd) sshd=1 ;; esac
     done
     [[ -d /sys/class/net/wg-si ]] && wg=1
@@ -35,7 +35,7 @@ __si_motd() {
     while read -r fs size used _ _ mnt; do
         [[ $size =~ ^[0-9]+$ ]] || continue
         case $mnt in
-            /)    disk="$((used / 1048576))/$((size / 1048576)) GB" ;;
+            /)    disk="$((used / 1048576))/$((size / 1048576)) GB"; ((size > 0)) && disk_pct=$((used * 100 / size)) ;;
             /tmp) if [[ $fs == tmpfs ]]; then tmp="$((used / 1024))/$((size / 1024)) MB tmpfs"; fi ;;
         esac
     done <<< "$df_out"
@@ -54,5 +54,12 @@ __si_motd() {
         printf 'batt %s%%%s%s\n' "$cap" "${status:+ ${status,,}}" \
             "${temp:+ · $((temp / 10)).$((temp % 10))°C}"
     fi
-    printf 'tunnel %s · wstunnel %s · sshd %s\n\n' "$m_wg" "$m_ws" "$m_sshd"
+    printf 'tunnel %s · wstunnel %s · sshd %s\n' "$m_wg" "$m_ws" "$m_sshd"
+    # Things worth acting on: a phone that runs for months mostly dies of
+    # heat, a battery held at 100%, or a full disk.
+    [[ $temp =~ ^[0-9]+$ ]] && ((temp >= 420)) && notes+=" battery hot ($((temp / 10))°C), let it cool or lower the load;"
+    [[ $cap == 100 && ${status,,} =~ ^(full|charging)$ ]] && notes+=" battery held at 100%, a charge limit is kinder to it;"
+    ((disk_pct >= 90)) && notes+=" disk ${disk_pct}% full;"
+    [[ -n $notes ]] && printf '%snote%s%s\n' "$y" "$r" "${notes%;}"
+    printf '\n'
 }
