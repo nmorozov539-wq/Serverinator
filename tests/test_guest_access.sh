@@ -107,6 +107,8 @@ kill "$fake" 2>/dev/null; wait "$fake" 2>/dev/null
 if have_sshd="$(command -v sshd || ls /usr/sbin/sshd 2>/dev/null)" && [[ -n "$have_sshd" ]]; then
     # The real sshd must accept the rules, and they must not leak to root.
     ssh-keygen -q -t ed25519 -N '' -f "$tmp/hk"
+    # As root, sshd -t also wants its privilege separation folder.
+    [[ "$(id -u)" != 0 ]] || mkdir -p /run/sshd
     printf 'HostKey %s\nPermitRootLogin prohibit-password\n' "$tmp/hk" > "$tmp/sshd_main"
     cat "$tmp/root/etc/ssh/serverinator-guests.conf" > "$tmp/guests.conf"
     printf 'X11Forwarding yes\nInclude %s\n' "$tmp/guests.conf" >> "$tmp/sshd_main"

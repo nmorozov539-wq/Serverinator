@@ -9,6 +9,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHONE_SCRIPT="$REPO_ROOT/core/core-phone.sh"
 VPS_SCRIPT="$REPO_ROOT/core/core-vps.sh"
 
+# Run through sudo (CI's root pass), SUDO_USER would point the VPS code at
+# that user's real home and authorized_keys. Tests that need it set it.
+unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND
+
 # Stand-ins for wg, debootstrap and the downloads (tests/fakes/README).
 export PATH="$REPO_ROOT/tests/fakes:$PATH"
 

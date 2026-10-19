@@ -16,7 +16,7 @@ _remove_all_vps_jump_entries() {
         [[ -f "$rec" ]] || continue
         user="$(json_get "$rec" ssh_vps_user 2>/dev/null || true)"
         [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || continue
-        if [[ "$user" == root ]]; then home="${SERVERINATOR_VPS_ADMIN_HOME:-/root}"
+        if [[ "$user" == root || "$DEV" == 1 ]]; then home="${SERVERINATOR_VPS_ADMIN_HOME:-/root}"
         else home="$(getent passwd "$user" | cut -d: -f6 || true)"; fi
         [[ -z "$home" ]] || homes+=("$home")
     done
