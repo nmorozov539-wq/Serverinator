@@ -11,7 +11,7 @@ jobs:
   tests:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install what the tests need
         run: sudo apt-get update && sudo apt-get install -y jq openssh-client openssh-server util-linux curl shellcheck
