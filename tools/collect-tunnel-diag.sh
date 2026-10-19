@@ -24,7 +24,7 @@ Usage: collect-tunnel-diag.sh [--duration N] [--interactive-sudo] [--dry-run]
 Environment: DIAG_DURATION, DIAG_INTERVAL, DIAG_WG_IF, DIAG_PHONE_NAME, DIAG_PHONE_IP,
 DIAG_VPS_WG_IP, DIAG_VPS_HOST, DIAG_VPS_USER, DIAG_TLS_PORT, DIAG_WG_PORT,
 DIAG_LOCAL_UDP, DIAG_SSH_PORT, DIAG_CHROOT, DIAG_ADB_SERIAL.
-Run from the laptop. The default requires VPS sudo -n. Use --interactive-sudo
+Run from a client device (any machine with ssh). The default requires VPS sudo -n. Use --interactive-sudo
 when sudo needs a password; its VPS output is also shown so the prompt remains visible.
 Collects metadata only; does not restart the client or enable DEBUG logging.
 HELP
