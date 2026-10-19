@@ -25,7 +25,7 @@ export PATH
 unset _si_dir
 
 # The release, shown by --version and si version. Bumped with each one.
-SERVERINATOR_VERSION="2026.10.18"
+SERVERINATOR_VERSION="2026.10.19"
 
 # ── Shared settings ────────────────────────────
 # Defined once here; each script still honours its SERVERINATOR_* override.
