@@ -242,6 +242,16 @@ prepare_source() { # MODE PATH
         chmod g+rwxs "$src"
         warn "$src now belongs to group $GUEST_GROUP so guests can write there; files already inside keep their own permissions"
     fi
+    # Read-only shares keep their modes. Root's umask in the chroot is 077, so
+    # a folder made over ssh is often closed to guests: say so.
+    if [[ "$mode" == ro ]]; then
+        local perm group bits
+        perm="$(stat -c '%a' "$src")" group="$(stat -c '%G' "$src")"
+        bits="${perm: -1}"
+        [[ "$group" == "$GUEST_GROUP" ]] && bits="${perm: -2:1}"
+        (( (bits & 5) == 5 )) \
+            || warn "Guests can't open $src (mode $perm, group $group). Run: chmod -R o+rX $src"
+    fi
 }
 
 mount_folder() { # ROOM MODE PATH

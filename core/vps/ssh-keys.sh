@@ -118,6 +118,8 @@ setup_vps_ssh_keys() {
         while IFS= read -r line || [[ -n "$line" ]]; do
             line="${line%$'\r'}"
             [[ -z "$line" || "$line" == \#* ]] && continue
+            # Our own restricted jump entries (_authorize_vps_jump_key).
+            [[ "$line" == "command=\"echo 'ServerInator: forwarding-only key"* ]] && continue
             if is_plain_pubkey "$line"; then
                 found+=("$line")
             else

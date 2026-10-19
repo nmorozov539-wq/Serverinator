@@ -24,6 +24,17 @@ assert_eq 0 "$rc" 'phone uninstall succeeds in DEV'
 assert_file_missing "$SERVERINATOR_CHROOT" 'phone root removed after unmount checks'
 assert_file_exists "$SERVERINATOR_SSH_HOSTKEY_DIR/ssh_host_ed25519_key" 'host identity preserved'
 assert_file_exists "$SERVERINATOR_SERVICE_D/personal.sh" 'personal service preserved'
+echo "Test: uninstall takes add-on boot scripts with it"
+mkdir -p "$SERVERINATOR_CHROOT/etc/wireguard" "$tmp/phone/modules/serverinator-personal" "$tmp/phone/modules/other"
+touch "$tmp/phone/modules/other/module.prop" "$SERVERINATOR_SERVICE_D/50-personal-vaultwarden.sh" "$SERVERINATOR_SERVICE_D/50-personal-vaultwarden.sh.bak" "$SERVERINATOR_SERVICE_D/50-other-x.sh"
+rc=0; out="$(SERVERINATOR_MODULES_DIR="$tmp/phone/modules" bash "$PHONE_SCRIPT" --uninstall --yes 2>&1)" || rc=$?
+assert_eq 0 "$rc" 'uninstall with an add-on succeeds'
+assert_contains "$out" 'add-on services that run in it, and their boot scripts: personal-vaultwarden' 'the summary names them'
+assert_file_missing "$SERVERINATOR_SERVICE_D/50-personal-vaultwarden.sh" 'add-on boot script removed'
+assert_file_missing "$SERVERINATOR_SERVICE_D/50-personal-vaultwarden.sh.bak" 'and its backup'
+assert_file_exists "$SERVERINATOR_SERVICE_D/50-other-x.sh" 'a script with no serverinator- module stays'
+assert_file_missing "$tmp/phone/modules/serverinator-personal" 'add-on module removed'
+assert_file_exists "$tmp/phone/modules/other/module.prop" 'foreign module stays'
 rc=0; bash "$PHONE_SCRIPT" --uninstall --purge --yes > "$tmp/out" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'purge succeeds'
 assert_file_missing "$SERVERINATOR_SSH_HOSTKEY_DIR" 'explicit purge removes identity'

@@ -366,6 +366,15 @@ done
 rc=0; bash -c 'source "$1" >/dev/null 2>&1; folder_path_ok /srv/files/photos' _ "$REPO_ROOT/core/guest-helper.sh" || rc=$?
 assert_eq 0 "$rc" 'a normal folder still works'
 
+# Read-only shares keep their modes; a folder guests can't open gets a warning.
+echo "Test: a read-only folder closed to guests is pointed out"
+mkdir -p "$tmp/ro-closed" "$tmp/ro-open"; chmod 700 "$tmp/ro-closed"; chmod 755 "$tmp/ro-open"
+out="$(bash -c 'source "$1" >/dev/null 2>&1; prepare_source ro "$2"' _ "$HELPER" "$tmp/ro-closed" 2>&1)"
+assert_contains "$out" "Guests can't open $tmp/ro-closed (mode 700" 'mode 700 is pointed out'
+assert_contains "$out" "chmod -R o+rX $tmp/ro-closed" 'with the fix'
+out="$(bash -c 'source "$1" >/dev/null 2>&1; prepare_source ro "$2"' _ "$HELPER" "$tmp/ro-open" 2>&1)"
+assert_eq "" "$out" 'an open folder is shared silently'
+
 # ── Real chain (opt-in) ────────────────────────
 if [[ "${SERVERINATOR_TEST_REAL_GUESTS:-0}" != 1 || "$(id -u)" != 0 ]] || ! [[ -x /usr/sbin/sshd ]]; then
     echo "SKIP: real guest chain (set SERVERINATOR_TEST_REAL_GUESTS=1, as root, with sshd)"

@@ -162,7 +162,7 @@ check_guest_vps_sshd() {
     # has that subsystem configured; otherwise the request fails first.
     awk 'tolower($1)=="subsystem" && $2=="sftp"' <<< "$eff" | grep -q . \
         || warn "sshd has no 'Subsystem sftp' line; add 'Subsystem sftp internal-sftp' to /etc/ssh/sshd_config and reload sshd, or SFTP apps can't connect."
-    [[ -z "$(awk 'tolower($1)=="forcecommand"' <<< "$eff")" ]] \
+    [[ -z "$(awk 'tolower($1)=="forcecommand" && tolower($2)!="none"' <<< "$eff")" ]] \
         || warn "sshd has a ForceCommand for $GUEST_VPS_USER; it overrides the guest routing."
     # Shell guests jump through the VPS with a forwarding.
     [[ "$GUEST_SHELL" == 1 ]] || return 0

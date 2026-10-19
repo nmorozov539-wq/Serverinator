@@ -7,25 +7,28 @@ stop_exact_pid() {
     [[ "$pid" =~ ^[1-9][0-9]*$ && "$pid" != "$$" ]] || die "Invalid managed PID"
     [[ -d "/proc/$pid" ]] || return 0
     if [[ "$kind" == supervisor ]]; then
-        tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fx -e "$expected" -e "${expected}.bak" > /dev/null \
-            || die "PID file points to an unrelated supervisor; refusing kill"
+        tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fx -e "$expected" -e "${expected}.bak" > /dev/null \
+            || { [[ -d "/proc/$pid" ]] || return 0; die "PID file points to an unrelated supervisor; refusing kill"; }
     else
-        root="$(readlink "/proc/$pid/root")" || die "Cannot inspect process root"
+        root="$(readlink "/proc/$pid/root")" || { [[ -d "/proc/$pid" ]] || return 0; die "Cannot inspect process root"; }
         [[ "$root" == "$CHROOT" ]] || die "PID file points outside managed chroot"
     fi
-    kill -TERM "$pid" || die "Cannot stop managed process"
+    kill -TERM "$pid" 2>/dev/null || [[ ! -d "/proc/$pid" ]] || die "Cannot stop managed process"
     for _ in 1 2 3 4 5; do
         [[ -d "/proc/$pid" ]] || return 0
         sleep 1
     done
-    # Revalidate identity before escalation to avoid a reused PID.
+    # Revalidate identity before escalation to avoid a reused PID. A shell
+    # supervisor runs its TERM trap only after its current sleep, so it often
+    # exits right here: gone at any point counts as stopped.
     if [[ "$kind" == supervisor ]]; then
-        tr '\0' '\n' < "/proc/$pid/cmdline" | grep -Fx -e "$expected" -e "${expected}.bak" > /dev/null \
-            || die "PID identity changed before kill escalation"
+        tr '\0' '\n' 2>/dev/null < "/proc/$pid/cmdline" | grep -Fx -e "$expected" -e "${expected}.bak" > /dev/null \
+            || { [[ -d "/proc/$pid" ]] || return 0; die "PID identity changed before kill escalation"; }
     else
-        [[ "$(readlink "/proc/$pid/root")" == "$CHROOT" ]] || die "PID root changed before escalation"
+        root="$(readlink "/proc/$pid/root")" || { [[ -d "/proc/$pid" ]] || return 0; die "Cannot inspect process root"; }
+        [[ "$root" == "$CHROOT" ]] || die "PID root changed before escalation"
     fi
-    kill -KILL "$pid" || die "Cannot kill remaining managed process"
+    kill -KILL "$pid" 2>/dev/null || [[ ! -d "/proc/$pid" ]] || die "Cannot kill remaining managed process"
 }
 
 # What --uninstall is about to delete, so the question means something.
@@ -41,6 +44,9 @@ uninstall_summary() {
     for f in "$MAGISK_SERVICE_D"/[0-9][0-9]-serverinator-*.sh; do
         [[ -e "$f" ]] && { echo "    - the boot scripts in $MAGISK_SERVICE_D and the si command"; break; }
     done
+    local addons
+    addons="$(addon_boot_scripts | sed 's|.*/[0-9][0-9]-||; s|\.sh$||' | tr '\n' ' ')"
+    [[ -z "$addons" ]] || echo "    - add-on services that run in it, and their boot scripts: ${addons% }"
     if [[ "$PURGE" == 1 ]]; then
         echo "    - this phone's identity (WireGuard key, SSH host keys): the VPS and"
         echo "      every client will see a new phone after a reinstall"
@@ -50,6 +56,23 @@ uninstall_summary() {
     echo ""
 }
 
+# Boot scripts of add-ons built on Core: a module serverinator-ADDON runs
+# NN-ADDON-*.sh in service.d (Personal: 50-personal-NAME.sh). They run
+# inside the chroot, so they go with it.
+addon_boot_scripts() {
+    local module addon f
+    [[ -n "$MAGISK_MODULES_DIR" ]] || return 0
+    for module in "$MAGISK_MODULES_DIR"/serverinator-*; do
+        [[ -d "$module" ]] || continue
+        addon="${module##*/serverinator-}"
+        [[ "$addon" =~ ^[a-z][a-z0-9_]*$ ]] || continue
+        for f in "$MAGISK_SERVICE_D"/[0-9][0-9]-"$addon"-*.sh; do
+            [[ -f "$f" ]] && printf '%s\n' "$f"
+        done
+    done
+    return 0
+}
+
 uninstall_phone() {
     check_root
     safe_remove_path "$CHROOT"
@@ -57,8 +80,19 @@ uninstall_phone() {
     confirm_destructive "Remove it?"
     safe_remove_path "$SSH_HOSTKEY_DIR"
     safe_remove_path "$IDENTITY_DIR"
-    local name file pid proc script
+    local name file pid proc script addon_scripts=()
+    mapfile -t addon_scripts < <(addon_boot_scripts)
     if [[ "$DEV" != 1 ]]; then
+        # Add-on supervisors first, or they restart their services in the
+        # chroot while it is being taken apart.
+        for script in ${addon_scripts[@]+"${addon_scripts[@]}"}; do
+            for proc in /proc/[0-9]*; do
+                [[ -e "$proc/cmdline" ]] || continue
+                if tr '\0' '\n' 2>/dev/null < "$proc/cmdline" | grep -Fx -e "$script" > /dev/null; then
+                    stop_exact_pid "${proc##*/}" "$script" supervisor
+                fi
+            done
+        done
         # Stop only supervisors named by exact script argv and children in this root.
         for name in wstunnel sshd wireguard tmpclean; do
             case "$name" in
@@ -75,7 +109,7 @@ uninstall_phone() {
                 # Android host access(R_OK) may report false even when root can
                 # read the file. Check existence, then inspect the actual argv.
                 [[ -e "$proc/cmdline" ]] || continue
-                if tr '\0' '\n' < "$proc/cmdline" | grep -Fx -e "$script" -e "${script}.bak" > /dev/null; then
+                if tr '\0' '\n' 2>/dev/null < "$proc/cmdline" | grep -Fx -e "$script" -e "${script}.bak" > /dev/null; then
                     stop_exact_pid "${proc##*/}" "$script" supervisor
                 fi
             done
@@ -114,6 +148,9 @@ uninstall_phone() {
     [[ -z "$(phone_mounts)" ]] || die "Mounted paths remain; refusing rootfs deletion"
     for name in 00-serverinator-mount 10-serverinator-wstunnel 20-serverinator-wireguard 30-serverinator-sshd 40-serverinator-tmpclean; do
         rm -f "$MAGISK_SERVICE_D/$name.sh" "$MAGISK_SERVICE_D/$name.sh.bak"
+    done
+    for script in ${addon_scripts[@]+"${addon_scripts[@]}"}; do
+        rm -f "$script" "$script.bak"
     done
     rm -rf "$CHROOT"
     if [[ "$PURGE" == 1 ]]; then rm -rf "$SSH_HOSTKEY_DIR" "$IDENTITY_DIR" "$STATE_DIR/vps-target"; fi

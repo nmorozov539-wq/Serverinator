@@ -79,6 +79,7 @@ uninstall_vps() {
     bin_dir="$(cd "$CORE_DIR" && pwd -P)"
     if [[ "$DEV" != 1 && "$bin_dir" == /root/.serverinator/bin ]]; then
         rm -f "$bin_dir"/core-vps.sh "$bin_dir"/lib.sh "$bin_dir"/si
+        rm -rf "$bin_dir"/vps "$bin_dir"/templates
         rmdir "$bin_dir" /root/.serverinator 2>/dev/null || true
         info "Removed the scripts in $bin_dir"
     fi

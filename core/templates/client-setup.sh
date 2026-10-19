@@ -37,6 +37,14 @@ case "$SI_KEY_MODE" in
     carried)
         # The private key. This script is its only copy once fetched: keep it safe.
         KEY="$HOME/.ssh/${SI_KEY_NAME}"
+        # A key of the same name from an earlier install (the VPS was set up
+        # again and made a new one) would lock us out: keep it aside.
+        if [[ -f "$KEY" && "$(ssh-keygen -y -f "$KEY" 2>/dev/null | awk '{print $1" "$2}')" != "$(printf '%s\n' "$SI_KEY_PUB" | awk '{print $1" "$2}')" ]]; then
+            old="$KEY.old-$(date +%Y%m%d-%H%M%S)"
+            mv "$KEY" "$old"
+            [[ ! -f "$KEY.pub" ]] || mv "$KEY.pub" "$old.pub"
+            echo "An older key was at $KEY; moved it to $old"
+        fi
         if [[ ! -f "$KEY" ]]; then
             printf '%s' "$SI_KEY_B64" | base64 -d > "$KEY"
             chmod 600 "$KEY"

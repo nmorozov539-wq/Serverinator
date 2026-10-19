@@ -337,10 +337,10 @@ The file contains private keys, so treat it like a password.
 ## Uninstall
 
 On the phone, this removes the chroot, the autostart scripts and the `si`
-command. The phone's WireGuard and SSH host keys are kept so a reinstall
-keeps the same identity; `--purge` deletes them too. It lists what it will
-delete (the chroot with its size) and asks first; `--yes` answers for
-scripts.
+command, and stops and removes add-ons that run in the chroot. The phone's
+WireGuard and SSH host keys are kept so a reinstall keeps the same
+identity; `--purge` deletes them too. It lists what it will delete (the
+chroot with its size) and asks first; `--yes` answers for scripts.
 
 ```
 si uninstall [--purge] [--yes]
@@ -355,8 +355,8 @@ ssh your-vps si uninstall
 
 A VPS uninstall forgets the domain and the client keys. After installing
 again, run `si set-domain DOMAIN` on the phone if you used one, and give
-each client the new setup script (move its old `~/.ssh/si-ALIAS` key
-aside first: the script keeps a key that already exists).
+each client the new setup script. It moves the client's old
+`~/.ssh/si-ALIAS` key aside (to `si-ALIAS.old-DATE`) and installs the new one.
 
 ## Security model
 
