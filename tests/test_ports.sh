@@ -235,4 +235,19 @@ MOCK
 assert_eq 0 "$rc" 'default/explicit skip makes no firewall calls; uninstall removes only recorded owned rule'
 if [[ "$rc" != 0 ]]; then cat "$tmp/mss.log"; fi
 
+# An active firewall that blocks the wstunnel port is the usual reason a fresh install can't connect.
+echo "Test: firewall warning"
+fw() { # SCENARIO
+    SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/f" bash -c 'source "$1"; WSTUNNEL_PORT=9443; scenario="$2"
+        have_cmd() { case "$1" in ufw) [[ $scenario == ufw* ]];; iptables) [[ $scenario == ipt* ]];; *) return 1;; esac; }
+        ufw() { echo "Status: active"; echo; [[ $scenario == ufw-open ]] && echo "9443/tcp                   ALLOW       Anywhere"; echo "22/tcp ALLOW Anywhere"; }
+        iptables() { echo "-P INPUT DROP"; [[ $scenario == ipt-open ]] && echo "-A INPUT -p tcp -m tcp --dport 9443 -j ACCEPT"; true; }
+        check_firewall' _ "$VPS_SCRIPT" "$1" 2>&1
+}
+assert_contains "$(fw ufw-closed)" 'ufw allow 9443/tcp' 'active ufw without the port: warns with the command'
+assert_eq '' "$(fw ufw-open)" 'ufw with the port open: silent'
+assert_contains "$(fw ipt-closed)" 'iptables -I INPUT -p tcp --dport 9443' 'default-drop iptables: warns'
+assert_eq '' "$(fw ipt-open)" 'iptables with an ACCEPT rule: silent'
+assert_eq '' "$(fw none)" 'no firewall: silent'
+
 exit "$TESTS_FAILED"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Client keys, one per device (owner's call, 2026-10-17): pairing scripts that
+# Client keys, one per device: pairing scripts that
 # carry no secret, --pubkey, VPS-made keys handed out once by --client-script,
 # --expires, and the last login per key in --list-clients.
 set -uo pipefail
@@ -34,7 +34,7 @@ assert_eq 0 "$rc" 'pairing succeeds'
 script="$key_dir/client-setup-laptop-rn9p.sh"
 assert_file_exists "$script" 'pairing script written'
 assert_file_missing "$key_dir/owner_rn9p_laptop.pub" 'nothing registered yet'
-assert_not_contains "$(cat "$script")" 'base64 -d' 'the script holds no key'
+assert_contains "$(cat "$script")" "SI_KEY_B64=''" 'the script holds no key'
 assert_contains "$out" 'si client-script laptop --device rn9p' 'says how to fetch it'
 assert_contains "$(vps --list-clients 2>&1)" 'Waiting for approval: laptop' 'listed as waiting'
 
@@ -57,7 +57,7 @@ assert_eq 0 "$rc" 'approval succeeds'
 assert_contains "$(cat "$phone_ak")" "$pub" 'key on the phone'
 assert_contains "$(cat "$admin_ak")" "permitopen=\"${TEST_PHONE_IP}:2222\" $pub" 'restricted jump entry on the VPS'
 assert_file_missing "$key_dir/owner_rn9p_laptop" 'no private key on the VPS'
-assert_not_contains "$(cat "$script")" 'base64 -d' 'the new script holds no key either'
+assert_contains "$(cat "$script")" "SI_KEY_B64=''" 'the new script holds no key either'
 assert_contains "$(cat "$script")" "EXPECTED='$pub'" 'it is tied to that key'
 rc=0; vps --add-client tablet --pubkey "$pub" > "$tmp/dup.log" 2>&1 || rc=$?
 assert_eq 1 "$rc" 'the same key for a second label is refused'
@@ -87,11 +87,9 @@ assert_contains "$(cat "$tmp/friend.err")" 'only copy' 'and says so'
 out="$(device friend "$tmp/friend.sh")"
 assert_file_exists "$tmp/dev-friend/.ssh/si-rn9p-friend.pub" 'public half installed too'
 vps --client-script friend > "$tmp/friend2.sh" 2>/dev/null
-assert_not_contains "$(cat "$tmp/friend2.sh")" 'base64 -d' 'second fetch has no key'
+assert_contains "$(cat "$tmp/friend2.sh")" "SI_KEY_B64=''" 'second fetch has no key'
 out="$(device friend "$tmp/friend2.sh")"; rc=$?
 assert_eq 0 "$rc" 'second script still works on that device'
-vps --client-script friend --windows > "$tmp/friend.ps1" 2>/dev/null
-assert_contains "$(cat "$tmp/friend.ps1")" '$Expected' 'Windows version on request'
 
 echo "Test: the owner key"
 vps --client-script owner > "$tmp/owner.sh" 2>/dev/null

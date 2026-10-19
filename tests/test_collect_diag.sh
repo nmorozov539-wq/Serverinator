@@ -6,7 +6,7 @@ collector="$REPO_ROOT/tools/collect-tunnel-diag.sh"
 (cd "$tmp"; bash "$collector" --dry-run --duration 2) > "$tmp/dry" 2>&1
 assert_eq 0 "$?" 'dry-run succeeds'
 assert_contains "$(cat "$tmp/dry")" 'adb' 'phone command printed'
-assert_contains "$(cat "$tmp/dry")" 'admin@' 'VPS command printed'
+assert_contains "$(cat "$tmp/dry")" 'uber@' 'VPS command printed'
 assert_eq 0 "$(find "$tmp" -maxdepth 1 -name 'diag-*' | wc -l | tr -d ' ')" 'dry-run creates no artifacts'
 assert_not_contains "$(cat "$tmp/dry")" 'wg show all dump' 'no secret WG dump'
 assert_contains "$(cat "$tmp/dry")" '/proc/net/snmp' 'counter fallback present'

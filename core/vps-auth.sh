@@ -310,11 +310,11 @@ _auth_wait_and_check() {
 _auth_sudo_script() { # LOCAL_SCRIPT_FILE → prints captured output
     local remote=".si-auth-$$.sh" rc=0
     # shellcheck disable=SC2046
-    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=30 "$VPS_TARGET" "umask 077; cat > $remote" < "$1" \
+    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=30 "$VPS_TARGET" "umask 077; cat > $(remote_cmd "$remote")" < "$1" \
         || die "Could not upload a helper script to the VPS"
     # shellcheck disable=SC2046
     ssh $(_auth_key_opts) $(_auth_known_hosts_opts) -o BatchMode=no -t "$VPS_TARGET" \
-        "sudo sh $remote; rc=\$?; rm -f $remote; exit \$rc" | tee "$AUTH_TMP/sudo.out" || rc=$?
+        "sudo sh $(remote_cmd "$remote"); rc=\$?; rm -f $(remote_cmd "$remote"); exit \$rc" | tee "$AUTH_TMP/sudo.out" || rc=$?
     tr -d '\r' < "$AUTH_TMP/sudo.out"
     return "$rc"
 }

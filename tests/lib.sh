@@ -9,6 +9,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHONE_SCRIPT="$REPO_ROOT/core/core-phone.sh"
 VPS_SCRIPT="$REPO_ROOT/core/core-vps.sh"
 
+# Stand-ins for wg, debootstrap and the downloads (tests/fakes/README).
+export PATH="$REPO_ROOT/tests/fakes:$PATH"
+
 TESTS_PASSED=0
 TESTS_FAILED=0
 
@@ -53,6 +56,16 @@ assert_file_missing() { # path label
     else
         failtest "$2 (unexpected path exists: $1)"
     fi
+}
+
+# client_setup_result SCRIPT: runs a client setup script in an empty HOME and
+# prints what it said, then the ~/.ssh/config it wrote.
+client_setup_result() {
+    local home
+    home="$(mktemp -d)"
+    HOME="$home" bash "$1" 2>&1
+    cat "$home/.ssh/config" 2>/dev/null
+    rm -rf "$home"
 }
 
 export TEST_PHONE_IP="10.66.69.$((1 + 1))"

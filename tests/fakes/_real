@@ -1,0 +1,13 @@
+# Sourced by the fakes: the real program, found on PATH without this folder.
+real() { # NAME ARGS...
+    local name="$1" dir here
+    shift
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local IFS=:
+    for dir in $PATH; do
+        [[ "$dir" == "$here" || -z "$dir" ]] && continue
+        if [[ -x "$dir/$name" ]]; then exec "$dir/$name" "$@"; fi
+    done
+    echo "$name: not found" >&2
+    exit 127
+}

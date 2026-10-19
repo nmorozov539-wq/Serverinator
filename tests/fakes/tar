@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Test stand-in for tar: a marker archive from the curl fake "extracts" a
+# fake wstunnel (when that member is asked for) or a minimal rootfs.
+source "$(dirname "$0")/_real"
+archive="" dir="." members=()
+args=("$@")
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -C) dir="$2"; shift 2; continue ;;
+        -*f) archive="$2"; shift 2; continue ;;
+        -*) ;;
+        *) members+=("$1") ;;
+    esac
+    shift
+done
+if [[ -n "$archive" && -f "$archive" ]] && read -r tag name < "$archive" && [[ "$tag" == FAKE-DOWNLOAD ]]; then
+    if [[ " ${members[*]} " == *" wstunnel "* ]]; then
+        version="${name#wstunnel_}"; version="${version%%_*}"
+        printf '#!/usr/bin/env bash\ncase "${1:-}" in --version) echo "wstunnel v%s";; esac\necho "wstunnel (test fake): $*"\n' "$version" > "$dir/wstunnel"
+        chmod 755 "$dir/wstunnel"
+    else
+        mkdir -p "$dir"/{bin,etc,usr/bin,usr/local/bin}
+        touch "$dir/bin/sh" "$dir/usr/bin/env" "$dir/usr/bin/dpkg" "$dir/etc/os-release"
+    fi
+    exit 0
+fi
+real tar "${args[@]}"

@@ -58,7 +58,9 @@ assert_contains "$res" "$tmp/defaultroot/back-handoff.json" "back-handoff under 
 echo "Test: VPS full DEV setup runs without touching real system commands"
 mkdir -p "$tmp/bin"
 marker="$tmp/forbidden_calls"
-for c in systemctl apt-get apt curl wg wg-quick ip; do
+# The download (curl) and key generation (wg) still run, against the fakes in
+# tests/fakes; these would change the real system.
+for c in systemctl apt-get apt wg-quick ip; do
     cat > "$tmp/bin/$c" <<EOF
 #!/usr/bin/env bash
 echo "$c \$*" >> "$marker"
@@ -83,7 +85,7 @@ assert_not_contains "$out" "[ERROR]" "no errors during VPS DEV setup"
 assert_file_missing "$marker" "no real system commands invoked in DEV"
 assert_file_exists "$devroot/etc/wireguard/wg-si.conf" "WG config under DEV root"
 assert_file_exists "$devroot/etc/systemd/system/wstunnel-serverinator.service" "unit under DEV root"
-assert_file_exists "$devroot/usr/local/bin/wstunnel" "wstunnel stub under DEV root"
+assert_file_exists "$devroot/usr/local/bin/wstunnel" "wstunnel under DEV root"
 assert_file_exists "$devroot/back-handoff.json" "back-handoff under DEV root"
 
 exit "$TESTS_FAILED"

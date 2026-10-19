@@ -90,6 +90,7 @@ export SERVERINATOR_DEV=1 SERVERINATOR_MODULES_DIR="$tmp/modules"
 src="$tmp/src"; mkdir -p "$src/core"
 cp "$REPO_ROOT/serverinator.sh" "$src/"
 cp "$REPO_ROOT"/core/*.sh "$REPO_ROOT/core/motd.bash" "$REPO_ROOT/core/si" "$src/core/"
+cp -r "$REPO_ROOT/core/phone" "$REPO_ROOT/core/vps" "$REPO_ROOT/core/templates" "$src/core/"
 istate="$tmp/istate"; mkdir -p "$istate/bin/extra"; touch "$istate/bin/extra/keep"
 (
     export SERVERINATOR_STATE_DIR="$istate"
@@ -104,6 +105,9 @@ assert_contains "$(cat "$tmp/install.out")" 'rc=0' 'install: succeeds'
 assert_file_exists "$istate/bin/serverinator.sh" 'install: serverinator.sh copied'
 assert_file_exists "$istate/bin/core/si" 'install: si copied'
 assert_file_exists "$istate/bin/core/core-vps.sh" 'install: core-vps.sh copied'
+assert_file_exists "$istate/bin/core/vps/clients.sh" 'install: core/vps/ copied'
+assert_file_exists "$istate/bin/core/phone/sshd.sh" 'install: core/phone/ copied'
+assert_file_exists "$istate/bin/core/templates/magisk-sshd.sh" 'install: core/templates/ copied'
 assert_file_exists "$istate/bin/extra/keep" 'install: whatever else is in bin stays'
 launcher="$tmp/modules/serverinator/system/bin/si"
 assert_file_exists "$launcher" 'install: launcher in the Magisk module'

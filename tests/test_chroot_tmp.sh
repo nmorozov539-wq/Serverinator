@@ -42,4 +42,12 @@ if command -v dash > /dev/null; then
     CHROOT_TMP_MODE=disk; write_tmpclean_autostart > /dev/null
     for f in "$mount_script" "$cleaner"; do dash -n "$f"; assert_eq 0 "$?" "POSIX syntax: $(basename "$f")"; done
 fi
+
+# Some networks block the default DNS servers.
+echo "Test: chroot DNS servers can be changed"
+dns() { SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/p" SERVERINATOR_SERVICE_D="$tmp/svc" bash -c 'source "$1"; chroot_resolv_conf' _ "$PHONE_SCRIPT" 2>&1; }
+assert_contains "$(dns)" $'nameserver 8.8.8.8\nnameserver 1.1.1.1' 'default servers unchanged'
+assert_contains "$(SERVERINATOR_DNS='9.9.9.9 2620:fe::fe' dns)" $'nameserver 9.9.9.9\nnameserver 2620:fe::fe' 'custom IPv4 and IPv6 servers'
+SERVERINATOR_DNS='9.9.9.9 evil;rm' dns > /dev/null; assert_eq 1 "$?" 'non-IP value refused'
+
 exit "$TESTS_FAILED"

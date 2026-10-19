@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Test stand-in for sha256sum: a marker file from the curl fake hashes to the
+# pinned checksum of the file it stands for; real files are hashed for real.
+source "$(dirname "$0")/_real"
+if [[ $# -eq 1 && -f "$1" ]] && read -r tag name < "$1" && [[ "$tag" == FAKE-DOWNLOAD ]]; then
+    hash="$(bash -c 'source "$1"; pinned_sha256 "$2"' _ "$(dirname "$0")/../../core/lib.sh" "$name")" || exit 1
+    printf '%s  %s\n' "$hash" "$1"
+    exit 0
+fi
+real sha256sum "$@"

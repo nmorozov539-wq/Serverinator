@@ -80,7 +80,7 @@ assert_file_exists "$unit" 'wstunnel unit written'
 assert_not_contains "$(cat "$unit")" '--tls-certificate' 'no certificate options'
 assert_file_missing "$tls_state" 'no tls.json'
 assert_eq "" "$(jq -r '.vps_domain // ""' "$record")" 'device record has no domain'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" 'HostName 203.0.113.9' 'client script jumps through the IP'
+assert_contains "$(client_setup_result "$key_dir/client-setup-owner-rn9p.sh")" 'HostName 203.0.113.9' 'client script jumps through the IP'
 
 echo "Test: --set-domain refuses a domain that doesn't resolve"
 DNS_ANSWER=""
@@ -122,8 +122,7 @@ assert_eq 203.0.113.9 "$(jq -r '.vps_ip' "$record")" 'and still the IP'
 hook="$le/renewal-hooks/deploy/serverinator-wstunnel.sh"
 assert_file_exists "$hook" 'renewal hook written'
 assert_contains "$(cat "$hook" 2>/dev/null)" 'systemctl try-restart wstunnel-serverinator.service' 'hook restarts wstunnel'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" "HostName $D" 'owner script rewritten to jump through the domain'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.ps1")" "'    HostName $D'" 'and the Windows one'
+assert_contains "$(client_setup_result "$key_dir/client-setup-owner-rn9p.sh")" "HostName $D" 'owner script rewritten to jump through the domain'
 assert_contains "$out" "bash serverinator.sh --set-domain $D" 'tells you what to run on each phone'
 
 echo "Test: a web server on port 80 is paused during the check"
@@ -146,15 +145,14 @@ assert_eq "$D" "$(jq -r '.vps_domain // ""' "$record")" 'and the record keeps it
 
 echo "Test: --add-client after the move jumps through the domain"
 vps --add-client laptop --generate-key > "$tmp/add.log"
-assert_contains "$(cat "$key_dir/client-setup-laptop-rn9p.sh")" "HostName $D" 'jump block for the domain'
-assert_contains "$(cat "$key_dir/client-setup-laptop-rn9p.ps1")" "'    HostName $D'" 'in the .ps1 too'
+assert_contains "$(client_setup_result "$key_dir/client-setup-laptop-rn9p.sh")" "HostName $D" 'jump block for the domain'
 
 echo "Test: --remove-domain goes back to the self-signed certificate"
 out="$(vps --remove-domain)"
 assert_not_contains "$(cat "$unit")" '--tls-certificate' 'certificate options gone'
 assert_file_missing "$tls_state" 'tls.json removed'
 assert_eq "" "$(jq -r '.vps_domain // ""' "$record")" 'record back on the IP'
-assert_contains "$(cat "$key_dir/client-setup-owner-rn9p.sh")" 'HostName 203.0.113.9' 'client script back on the IP'
+assert_contains "$(client_setup_result "$key_dir/client-setup-owner-rn9p.sh")" 'HostName 203.0.113.9' 'client script back on the IP'
 assert_contains "$out" 'bash serverinator.sh --remove-domain' 'tells you what to run on each phone'
 
 echo "Test: your own certificate"

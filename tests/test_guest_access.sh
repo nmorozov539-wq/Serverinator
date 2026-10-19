@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests guest file access: the phone helper (core/guest-helper.sh), the
-# phone's sshd rules, and the VPS commands (--add-guest, --guest-access,
-# --revoke-guest, --list-guests, --sync-guests) with the phone mocked.
+# phone's sshd rules, and the VPS commands (--add-guest for files-only and
+# shell guests, --revoke-guest, --list-guests, --sync-guests) with the phone
+# mocked.
 #
 # SERVERINATOR_TEST_REAL_GUESTS=1 (as root, with sshd) also runs the whole
 # chain for real: two local sshds standing in for the VPS and the phone, real
@@ -36,6 +37,9 @@ check 0 'rw spec parsed'      'parse_spec rw:/srv/files/photos; [[ $SPEC_MODE ==
 check 1 'unknown mode refused' 'parse_spec rx:/srv/files/photos'
 check 0 'ed25519 route key accepted' 'valid_pubkey "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBx1"'
 check 1 'key with options refused'   'valid_pubkey "command=\"x\" ssh-ed25519 AAAA"'
+check 1 'two folders for one guest refused' 'cmd_set anna rw:/srv/files/a rw:/srv/files/b < /dev/null'
+check 1 'a shell guest with a folder refused' 'cmd_set anna --shell rw:/srv/files/a < /dev/null'
+check 1 'a guest with neither refused'        'cmd_set anna < /dev/null'
 check 1 'uid below the guest range refused' 'valid_uid 1000'
 check 0 'uid in the guest range accepted'   'valid_uid 2001'
 
@@ -140,16 +144,16 @@ EOF
 # records each helper call (and what came on stdin) in $calls.
 vps() {
     SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$devroot" SERVERINATOR_VPS_IP=203.0.113.9 \
-    CALLS="$calls" PHONE_DOWN="${PHONE_DOWN:-0}" \
+    CALLS="$calls" PHONE_DOWN="${PHONE_DOWN:-0}" HELPER_VERSION="${HELPER_VERSION:-2}" \
         bash -c '
             source "$1"; shift
-            _phone_ssh() {
+            _phone_run() {
                 [[ "$PHONE_DOWN" == 1 ]] && return 255
                 local input=""
                 [[ "$2" == set ]] && input="$(cat)"
                 printf "%s | %s\n" "$*" "$input" >> "$CALLS"
                 case "$2" in
-                    version) echo 1 ;;
+                    version) echo "$HELPER_VERSION" ;;
                     set)     echo "created /srv/files/x"; echo "uid=2001" ;;
                     names)   printf "anna\nstale\n" ;;
                     list)    printf "anna uid=2001\n  rw /srv/files/photos 1.2G\n" ;;
@@ -174,26 +178,28 @@ assert_eq 'rw:/root/music' "$(norm /root/music/:rw)" 'full path kept, trailing s
 assert_eq '' "$(norm '../etc')" 'parent reference refused'
 assert_eq '' "$(norm 'a b')" 'space refused'
 
-echo "Test: --add-guest needs folders when there is no terminal"
+echo "Test: --add-guest needs a mode when there is no terminal"
 rc=0; vps --add-guest anna < /dev/null > "$tmp/nofolder.log" 2>&1 || rc=$?
-assert_eq 1 "$rc" 'add-guest without folders fails off a terminal'
-assert_contains "$(cat "$tmp/nofolder.log")" '--folder' 'says how to give folders'
+assert_eq 1 "$rc" 'add-guest without --folder or --shell fails off a terminal'
+assert_contains "$(cat "$tmp/nofolder.log")" '--folder' 'says how to give the folder'
+assert_contains "$(cat "$tmp/nofolder.log")" '--shell' 'says how to make a shell user'
 
-echo "Test: --add-guest with a generated key"
+echo "Test: files guest with a generated key"
 : > "$calls"
-rc=0; vps --add-guest anna --folder photos --folder /root/music:ro < /dev/null > "$tmp/add.log" 2>&1 || rc=$?
+rc=0; vps --add-guest anna --folder /root/music:ro < /dev/null > "$tmp/add.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'add-guest succeeds'
 rec="$gdir/anna.json"
 assert_file_exists "$rec" 'guest record written'
 assert_eq rn9p "$(jq -r .device "$rec")" 'record names the phone'
+assert_eq files "$(jq -r .mode "$rec")" 'record says files only'
 assert_eq 2001 "$(jq -r .uid "$rec")" 'record keeps the UID the phone chose'
-assert_eq 'rw:/srv/files/photos ro:/root/music' "$(jq -r '[.folders[] | "\(.mode):\(.path)"] | join(" ")' "$rec")" 'record keeps the folders'
+assert_eq 'ro:/root/music' "$(jq -r '[.folders[] | "\(.mode):\(.path)"] | join(" ")' "$rec")" 'record keeps the folder'
 assert_file_exists "$key_dir/guest_anna" 'guest key generated for hand-over'
 assert_file_exists "$ghome/routes/anna" 'route key generated'
 route_pub="$(awk '{print $1" "$2}' "$ghome/routes/anna.pub")"
 set_call="$(grep ' set anna ' "$calls")"
 assert_contains "$set_call" '--from 10.66.69.1' 'phone accepts the route key only from the VPS tunnel address'
-assert_contains "$set_call" 'rw:/srv/files/photos ro:/root/music' 'folders sent to the phone'
+assert_contains "$set_call" 'ro:/root/music |' 'folder sent to the phone'
 assert_contains "$set_call" "| $route_pub" 'route public key sent on stdin'
 assert_not_contains "$set_call" '--uid' 'new guest lets the phone pick a UID'
 ak="$(cat "$ghome/.ssh/authorized_keys")"
@@ -209,37 +215,85 @@ out="$(cat "$tmp/add.log")"
 assert_contains "$out" 'User     : serverinator-files' 'card shows the login name'
 assert_contains "$out" 'Host     : 203.0.113.9' 'card shows the VPS host'
 assert_contains "$out" "Key file : $key_dir/guest_anna" 'card shows the key file'
-assert_contains "$out" 'music (/root/music, read-only)' 'card lists folders with their mode'
+assert_contains "$out" 'music (/root/music, read-only)' 'card shows the folder with its mode'
+
+echo "Test: a guest gets one folder, and one mode"
+rc=0; vps --add-guest cleo --folder photos --folder docs > "$tmp/two.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" 'two folders refused'
+assert_contains "$(cat "$tmp/two.log")" 'one folder' 'says a guest gets one folder'
+rc=0; vps --add-guest cleo --folder photos --shell > "$tmp/both.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" '--folder with --shell refused'
+assert_file_missing "$gdir/cleo.json" 'nothing written'
 
 echo "Test: --add-guest refuses a duplicate"
 rc=0; vps --add-guest anna --folder photos > "$tmp/dup.log" 2>&1 || rc=$?
 assert_eq 1 "$rc" 'duplicate guest refused'
-assert_contains "$(cat "$tmp/dup.log")" '--guest-access anna' 'points at --guest-access'
+assert_contains "$(cat "$tmp/dup.log")" '--revoke-guest anna' 'points at revoke and add again'
+rc=0; vps --guest-access anna --folder docs > /dev/null 2>&1 || rc=$?
+assert_eq 1 "$rc" '--guest-access is gone'
 
-echo "Test: --add-guest with the guest's own key"
+echo "Test: files guest with the guest's own key"
 own="$(awk '{print $1" "$2}' "$tmp/phk.pub")"
-rc=0; vps --add-guest ben --folder photos:ro --pubkey "$own laptop" > "$tmp/ben.log" 2>&1 || rc=$?
+rc=0; vps --add-guest ben --folder photos --pubkey "$own laptop" > "$tmp/ben.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'add-guest with --pubkey succeeds'
 assert_file_missing "$key_dir/guest_ben" 'no key generated when the guest brings one'
 assert_contains "$(cat "$ghome/.ssh/authorized_keys")" "$own serverinator-guest:ben" 'guest-supplied key authorized'
+assert_eq 'rw:/srv/files/photos' "$(jq -r '[.folders[] | "\(.mode):\(.path)"] | join(" ")' "$gdir/ben.json")" 'bare name is read-write in /srv/files'
 assert_eq 2 "$(grep -c . "$ghome/.ssh/authorized_keys")" 'two guests, two lines'
 rc=0; vps --add-guest cleo --folder photos --pubkey 'ssh-rsa AAAAB3Nza' > /dev/null 2>&1 || rc=$?
 assert_eq 1 "$rc" 'non-ed25519 --pubkey refused'
 
-echo "Test: --guest-access replaces the folder list and keeps the UID"
+echo "Test: shell guest with a generated key"
 : > "$calls"
-rc=0; vps --guest-access anna --folder docs:ro > "$tmp/access.log" 2>&1 || rc=$?
-assert_eq 0 "$rc" 'guest-access succeeds'
-assert_eq 'ro:/srv/files/docs' "$(jq -r '[.folders[] | "\(.mode):\(.path)"] | join(" ")' "$rec")" 'folder list replaced'
-assert_contains "$(cat "$calls")" '--uid 2001' 'phone told to keep the same UID'
-assert_eq "$guest_pub" "$(jq -r .guest_pubkey "$rec")" 'guest key unchanged'
+rc=0; vps --add-guest carl --shell < /dev/null > "$tmp/carl.log" 2>&1 || rc=$?
+assert_eq 0 "$rc" 'add-guest --shell succeeds'
+crec="$gdir/carl.json"
+assert_eq shell "$(jq -r .mode "$crec")" 'record says shell'
+assert_eq 0 "$(jq '.folders | length' "$crec")" 'a shell guest has no folder'
+carl_pub="$(awk '{print $1" "$2}' "$key_dir/guest_carl.pub")"
+set_call="$(grep ' set carl ' "$calls")"
+assert_contains "$set_call" '--shell |' 'phone told to make a shell user'
+assert_contains "$set_call" '--from 10.66.69.1' 'phone accepts the key only from the VPS tunnel address'
+assert_contains "$set_call" "| $carl_pub" "the guest's own key goes to the phone"
+assert_file_missing "$ghome/routes/carl" 'no route key for a shell guest'
+line="$(grep 'serverinator-guest:carl' "$ghome/.ssh/authorized_keys")"
+assert_contains "$line" "permitopen=\"${TEST_PHONE_IP}:2222\"" 'shell guest may forward to its phone sshd only'
+assert_contains "$line" 'command="echo' 'shell guest gets no shell on the VPS'
+assert_contains "$line" ',restrict,port-forwarding,' 'everything else is off'
+setup="$key_dir/guest-setup-carl.sh"
+assert_file_exists "$setup" 'setup script written'
+out="$(client_setup_result "$setup")"
+assert_contains "$out" 'User carl' 'setup logs in as the guest on the phone'
+assert_contains "$out" 'User serverinator-files' 'setup jumps through the guest login user'
+assert_contains "$out" "HostName ${TEST_PHONE_IP}" 'setup reaches the phone through the tunnel'
+assert_contains "$out" 'Port 2222' "setup uses the phone's sshd port"
+assert_contains "$(cat "$setup")" "SI_KEY_MODE='carried'" 'setup carries the generated key'
+out="$(cat "$tmp/carl.log")"
+assert_contains "$out" 'shell user on rn9p' 'card says what carl gets'
+assert_contains "$out" "$setup" 'card names the setup script'
+assert_contains "$out" 'private key' 'card says to hand it over privately'
+
+echo "Test: shell guest with their own key"
+dan_key="$(ssh-keygen -q -t ed25519 -N '' -f "$tmp/dan" && awk '{print $1" "$2}' "$tmp/dan.pub")"
+rc=0; vps --add-guest dan --shell --pubkey "$tmp/dan.pub" > "$tmp/dan.log" 2>&1 || rc=$?
+assert_eq 0 "$rc" 'add-guest --shell --pubkey succeeds'
+assert_file_missing "$key_dir/guest_dan" 'no private key made or kept'
+assert_contains "$(cat "$key_dir/guest-setup-dan.sh")" "SI_KEY_EXPECTED='$dan_key'" 'setup only works where the key is'
+assert_contains "$(cat "$key_dir/guest-setup-dan.sh")" "SI_KEY_B64=''" 'setup carries no secret'
+
+echo "Test: a shell guest needs an up-to-date phone"
+rc=0; HELPER_VERSION=1 vps --add-guest erin --shell > "$tmp/old.log" 2>&1 || rc=$?
+assert_eq 1 "$rc" 'old phone refuses a shell guest'
+assert_contains "$(cat "$tmp/old.log")" 'Re-run serverinator.sh' 'says how to update the phone'
+assert_file_missing "$gdir/erin.json" 'nothing written'
 
 echo "Test: --list-guests"
 rc=0; vps --list-guests > "$tmp/list.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'list-guests succeeds'
 out="$(cat "$tmp/list.log")"
 assert_contains "$out" 'anna' 'lists anna'
-assert_contains "$out" 'docs (/srv/files/docs, read-only)' 'lists folders with mode'
+assert_contains "$out" 'music (/root/music, read-only)' 'lists the folder with its mode'
+assert_contains "$out" 'shell user, home /home/carl' 'lists the shell guest'
 assert_contains "$out" '1.2G' 'shows folder sizes from the phone'
 rc=0; PHONE_DOWN=1 vps --list-guests > "$tmp/list-down.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'list-guests works with the phone down'
@@ -250,11 +304,20 @@ echo "Test: --sync-guests recreates guests and drops unknown ones"
 rm -f "$ghome/routes/ben" "$ghome/routes/ben.pub"
 rc=0; vps --sync-guests > "$tmp/sync.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'sync-guests succeeds'
-assert_contains "$(cat "$calls")" 'set anna --from 10.66.69.1 --uid 2001' 'anna pushed with her UID'
+assert_contains "$(cat "$calls")" 'set anna --from 10.66.69.1 --uid 2001 ro:/root/music' 'anna pushed with her UID and folder'
 assert_contains "$(cat "$calls")" 'set ben ' 'ben pushed'
+assert_contains "$(cat "$calls")" "set carl --from 10.66.69.1 --uid 2001 --shell | $carl_pub" 'carl pushed as a shell user with his key'
 assert_file_exists "$ghome/routes/ben" 'missing route key recreated'
 assert_contains "$(cat "$calls")" 'remove stale' 'guest unknown to the VPS removed from the phone'
 assert_not_contains "$(cat "$calls")" 'remove anna' 'known guests kept'
+
+echo "Test: a guest record from before the one-folder rule"
+jq '.folders += [{mode: "rw", path: "/srv/files/old"}] | del(.mode)' "$gdir/ben.json" > "$tmp/ben.json" && mv "$tmp/ben.json" "$gdir/ben.json"
+: > "$calls"
+rc=0; vps --sync-guests > "$tmp/sync-old.log" 2>&1 || rc=$?
+assert_eq 0 "$rc" 'sync-guests reads the old record'
+assert_contains "$(grep ' set ben ' "$calls")" 'rw:/srv/files/photos |' 'only the first folder is pushed'
+assert_contains "$(cat "$tmp/sync-old.log")" 'only /srv/files/photos is kept' 'says which folder is kept'
 
 echo "Test: --revoke-guest works even with the phone down"
 rc=0; PHONE_DOWN=1 vps --revoke-guest ben > "$tmp/revoke.log" 2>&1 || rc=$?
@@ -269,20 +332,39 @@ rc=0; vps --revoke-guest anna > /dev/null 2>&1 || rc=$?
 assert_eq 0 "$rc" 'revoke-guest with the phone up'
 assert_contains "$(cat "$calls")" 'remove anna' 'phone account removed'
 assert_file_missing "$key_dir/guest_anna" 'generated guest key removed'
+rc=0; vps --revoke-guest carl > "$tmp/revoke-carl.log" 2>&1 || rc=$?
+assert_eq 0 "$rc" 'revoke a shell guest'
+assert_file_missing "$key_dir/guest-setup-carl.sh" 'its setup script removed'
+assert_file_missing "$key_dir/guest_carl" 'its key removed'
+assert_contains "$(cat "$tmp/revoke-carl.log")" 'home folder' 'says the home folder went too'
+vps --revoke-guest dan > /dev/null 2>&1
 assert_eq 0 "$(grep -c . "$ghome/.ssh/authorized_keys")" 'no guest lines left'
 
 echo "Test: --remove-device takes its guests along"
 vps --add-guest dora --folder photos > /dev/null 2>&1
+vps --add-guest eve --shell > /dev/null 2>&1
 rc=0; vps --remove-device rn9p > "$tmp/rmdev.log" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'remove-device succeeds'
 assert_file_missing "$gdir/dora.json" 'guest record removed with the phone'
-assert_eq 0 "$(grep -c . "$ghome/.ssh/authorized_keys")" 'guest route removed with the phone'
+assert_file_missing "$key_dir/guest-setup-eve.sh" 'shell guest setup removed with the phone'
+assert_eq 0 "$(grep -c . "$ghome/.ssh/authorized_keys")" 'guest routes removed with the phone'
 
 echo "Test: argument checks"
 rc=0; vps --list-clients --folder photos > /dev/null 2>&1 || rc=$?
 assert_eq 1 "$rc" '--folder without a guest command refused'
+rc=0; vps --list-clients --shell > /dev/null 2>&1 || rc=$?
+assert_eq 1 "$rc" '--shell without a guest command refused'
 rc=0; vps --add-guest 'Bad Name' --folder x > /dev/null 2>&1 || rc=$?
 assert_eq 1 "$rc" 'invalid guest name refused'
+
+# Sharing a .ssh or .gnupg folder would hand a guest the owner's keys.
+echo "Test: key folders can't be shared with guests"
+for p in /root/.ssh /home/x/.ssh/keys /root/.gnupg /srv/files/.ssh; do
+    rc=0; bash -c 'source "$1" >/dev/null 2>&1; folder_path_ok "$2"' _ "$REPO_ROOT/core/guest-helper.sh" "$p" || rc=$?
+    assert_eq 1 "$rc" "$p refused"
+done
+rc=0; bash -c 'source "$1" >/dev/null 2>&1; folder_path_ok /srv/files/photos' _ "$REPO_ROOT/core/guest-helper.sh" || rc=$?
+assert_eq 0 "$rc" 'a normal folder still works'
 
 # ── Real chain (opt-in) ────────────────────────
 if [[ "${SERVERINATOR_TEST_REAL_GUESTS:-0}" != 1 || "$(id -u)" != 0 ]] || ! [[ -x /usr/sbin/sshd ]]; then
@@ -294,13 +376,15 @@ echo "Test: real chain — SFTP app -> VPS sshd -> forced hop -> phone sshd -> r
 # ChrootDirectory needs every path component root-owned and not writable by
 # others, which rules out /tmp; /run is a system folder the helper refuses to share.
 base="$(mktemp -d -p /srv si-guests-test.XXXXXX)"; chmod 755 "$base"
-vuser="sitestfiles$$"; guest="sitestg$$"
+vuser="sitestfiles$$"; guest="sitestg$$"; sguest="sitests$$"
 cleanup_real() {
     for p in "$base"/*.pid; do [[ -f "$p" ]] && kill "$(cat "$p")" 2>/dev/null; done
     (export SI_GUESTS_STATE_DIR="$base/state" SI_GUESTS_ROOMS_DIR="$base/rooms" SI_GUESTS_KEYS_DIR="$base/keys"
-     bash "$HELPER" remove "$guest") >/dev/null 2>&1
+     bash "$HELPER" remove "$guest"; bash "$HELPER" remove "$sguest") >/dev/null 2>&1
     userdel -r "$vuser" >/dev/null 2>&1
-    awk -F: '$1=="serverinator-guests"' /etc/group | grep -q . && [[ -z "$(awk -F: '$1=="serverinator-guests" {print $4}' /etc/group)" ]] && groupdel serverinator-guests 2>/dev/null
+    for g in serverinator-guests serverinator-shell; do
+        getent group "$g" >/dev/null && [[ -z "$(getent group "$g" | cut -d: -f4)" ]] && groupdel "$g" 2>/dev/null
+    done
     rm -rf "$base" "$tmp"
 }
 trap cleanup_real EXIT
@@ -349,8 +433,8 @@ UsePAM no
 Subsystem sftp internal-sftp
 EOF
 
-# Phone helper: create the guest with one rw and one ro folder.
-out="$(awk '{print $1" "$2}' "$base/vps/home/routes/$guest.pub" | bash "$HELPER" set "$guest" --from 127.0.0.1 "rw:$base/files/photos" "ro:$base/files/docs" 2>&1)"
+# Phone helper: create the guest with a read-write folder.
+out="$(awk '{print $1" "$2}' "$base/vps/home/routes/$guest.pub" | bash "$HELPER" set "$guest" --from 127.0.0.1 "rw:$base/files/photos" 2>&1)"
 assert_contains "$out" 'uid=' 'helper creates the guest'
 uid="$(sed -n 's/^uid=//p' <<< "$out")"
 assert_eq "$(id -u "$guest" 2>/dev/null)" "$uid" 'guest user exists with that UID'
@@ -363,25 +447,24 @@ mkdir -p /run/sshd
 sleep 1
 sftp_as() { sftp -q -b - -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$base/guestkey" -P 2298 "$vuser@127.0.0.1" 2>&1; }
 echo photo-bytes > "$base/pic.jpg"
-out="$(printf 'put %s photos/pic.jpg\nmkdir photos/album\nrename photos/pic.jpg photos/album/pic.jpg\nget docs/readme.txt %s/got.txt\nls\n' "$base/pic.jpg" "$base" | sftp_as)"
+out="$(printf 'put %s photos/pic.jpg\nmkdir photos/album\nrename photos/pic.jpg photos/album/pic.jpg\nls\n' "$base/pic.jpg" | sftp_as)"
 assert_eq photo-bytes "$(cat "$base/files/photos/album/pic.jpg" 2>/dev/null)" 'upload lands in the shared folder on the phone'
 assert_eq "$uid" "$(stat -c %u "$base/files/photos/album/pic.jpg" 2>/dev/null)" 'uploaded file belongs to the guest'
-assert_eq hello "$(cat "$base/got.txt" 2>/dev/null)" 'download works'
-assert_contains "$out" 'docs' 'guest sees docs'
+assert_contains "$out" 'photos' 'guest sees the folder'
 assert_not_contains "$out" 'etc' 'guest sees nothing else'
-rc=0; printf 'put %s docs/x.jpg\n' "$base/pic.jpg" | sftp_as > /dev/null || rc=$?
-[[ "$rc" != 0 && ! -e "$base/files/docs/x.jpg" ]] && pass 'read-only folder refuses uploads' || failtest 'read-only folder refuses uploads'
 out="$(timeout 10 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$base/guestkey" -p 2298 "$vuser@127.0.0.1" id < /dev/null 2>&1)"
 assert_not_contains "$out" "uid=" 'guest key gets no shell on the VPS'
 rc=0; timeout 10 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$base/guestkey" -p 2299 "$guest@127.0.0.2" true < /dev/null > /dev/null 2>&1 || rc=$?
 [[ "$rc" != 0 ]] && pass 'guest key alone is not accepted by the phone' || failtest 'guest key alone is not accepted by the phone'
 
-# Change access: docs only, read-write; photos disappears from the room.
-awk '{print $1" "$2}' "$base/vps/home/routes/$guest.pub" | bash "$HELPER" set "$guest" --uid "$uid" --from 127.0.0.1 "rw:$base/files/docs" > /dev/null 2>&1
-[[ ! -e "$base/rooms/$guest/photos" ]] && pass 'removed folder leaves the room' || failtest 'removed folder leaves the room'
+# Set again (as --sync-guests does) with docs, read-only; photos leaves the room.
+awk '{print $1" "$2}' "$base/vps/home/routes/$guest.pub" | bash "$HELPER" set "$guest" --uid "$uid" --from 127.0.0.1 "ro:$base/files/docs" > /dev/null 2>&1
+[[ ! -e "$base/rooms/$guest/photos" ]] && pass 'the old folder leaves the room' || failtest 'the old folder leaves the room'
 assert_eq photo-bytes "$(cat "$base/files/photos/album/pic.jpg" 2>/dev/null)" 'its files stay in place'
-printf 'put %s docs/now.jpg\n' "$base/pic.jpg" | sftp_as > /dev/null
-assert_file_exists "$base/files/docs/now.jpg" 'folder switched to read-write'
+printf 'get docs/readme.txt %s/got.txt\n' "$base" | sftp_as > /dev/null
+assert_eq hello "$(cat "$base/got.txt" 2>/dev/null)" 'download works'
+rc=0; printf 'put %s docs/x.jpg\n' "$base/pic.jpg" | sftp_as > /dev/null || rc=$?
+[[ "$rc" != 0 && ! -e "$base/files/docs/x.jpg" ]] && pass 'read-only folder refuses uploads' || failtest 'read-only folder refuses uploads'
 
 # Boot: mounts are gone, mount-all brings them back.
 umount -l "$base/rooms/$guest/docs"
@@ -391,6 +474,31 @@ mountpoint -q "$base/rooms/$guest/docs" && pass 'mount-all restores the folders'
 bash "$HELPER" remove "$guest" > /dev/null 2>&1
 ! id "$guest" >/dev/null 2>&1 && pass 'remove deletes the guest user' || failtest 'remove deletes the guest user'
 [[ ! -e "$base/rooms/$guest" ]] && pass 'remove deletes the room' || failtest 'remove deletes the room'
-assert_file_exists "$base/files/docs/now.jpg" 'remove keeps the shared files'
+assert_file_exists "$base/files/docs/readme.txt" 'remove keeps the shared files'
+
+echo "Test: real chain — shell guest jumps through the VPS to a shell on the phone"
+ssh-keygen -q -t ed25519 -N '' -f "$base/shellkey"
+out="$(awk '{print $1" "$2}' "$base/shellkey.pub" | bash "$HELPER" set "$sguest" --from 127.0.0.1 --shell 2>&1)"
+assert_contains "$out" 'uid=' 'helper creates the shell guest'
+assert_eq "/home/$sguest" "$(getent passwd "$sguest" | cut -d: -f6)" 'shell guest has a home folder'
+assert_contains "$(cat "$base/keys/$sguest")" 'restrict,pty,from="127.0.0.1" ssh-ed25519' 'phone key line allows a terminal, from the VPS only'
+(
+    source "$VPS_SCRIPT" >/dev/null 2>&1
+    _guest_jump_line "$sguest" "$(awk '{print $1" "$2}' "$base/shellkey.pub")" 127.0.0.2 2299
+) >> "$base/vps/home/.ssh/authorized_keys"
+sshopts=(-o LogLevel=ERROR -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i "$base/shellkey")
+out="$(timeout 15 ssh "${sshopts[@]}" -o "ProxyCommand=ssh ${sshopts[*]} -p 2298 -W %h:%p $vuser@127.0.0.1" \
+        -p 2299 "$sguest@127.0.0.2" 'id -un; id -u; ls /' < /dev/null 2>&1)"
+assert_contains "$out" "$sguest" 'shell guest runs commands as itself on the phone'
+assert_contains "$out" 'usr' 'shell guest sees the whole system'
+[[ "$(sed -n 2p <<< "$out")" =~ ^[1-9][0-9]*$ ]] && pass 'shell guest is not root' || failtest 'shell guest is not root'
+out="$(timeout 10 ssh "${sshopts[@]}" -p 2298 "$vuser@127.0.0.1" id < /dev/null 2>&1)"
+assert_not_contains "$out" "uid=" 'shell guest key gets no shell on the VPS'
+rc=0; timeout 10 ssh "${sshopts[@]}" -o "ProxyCommand=ssh ${sshopts[*]} -p 2298 -W %h:%p $vuser@127.0.0.1" \
+    -p 22 "$sguest@127.0.0.2" true < /dev/null > /dev/null 2>&1 || rc=$?
+[[ "$rc" != 0 ]] && pass 'shell guest can only forward to the phone sshd' || failtest 'shell guest can only forward to the phone sshd'
+bash "$HELPER" remove "$sguest" > /dev/null 2>&1
+! id "$sguest" >/dev/null 2>&1 && pass 'remove deletes the shell guest' || failtest 'remove deletes the shell guest'
+[[ ! -e "/home/$sguest" ]] && pass 'remove deletes its home folder' || failtest 'remove deletes its home folder'
 
 exit "$TESTS_FAILED"

@@ -54,4 +54,17 @@ rc=0; is_plain_pubkey $'ssh-ed25519 AAAAX x\ncommand="sh" ssh-ed25519 AAAAY' || 
 assert_eq 1 "$rc" 'embedded newline rejected'
 rc=0; is_plain_pubkey 'command="sh" ssh-ed25519 AAAAY' || rc=$?
 assert_eq 1 "$rc" 'options rejected'
+
+# An admin's file without a final newline got our key glued onto their last key.
+echo "Test: appending to authorized_keys without a final newline"
+mkdir -p "$tmp/admin/.ssh"; printf 'ssh-ed25519 AAAAOLD admin@laptop' > "$tmp/admin/.ssh/authorized_keys"
+SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/dev" SERVERINATOR_VPS_ADMIN_HOME="$tmp/admin" \
+    bash -c 'source "$1"; _authorize_vps_jump_key "ssh-ed25519 AAAANEW c" 10.66.69.2 2222' _ "$VPS_SCRIPT" > /dev/null 2>&1
+assert_eq 'ssh-ed25519 AAAAOLD admin@laptop' "$(head -n 1 "$tmp/admin/.ssh/authorized_keys")" 'admin key line intact'
+assert_eq 2 "$(wc -l < "$tmp/admin/.ssh/authorized_keys")" 'jump entry on its own line'
+mkdir -p "$tmp/h/.ssh"; printf 'ssh-ed25519 AAAAOLD x' > "$tmp/h/.ssh/authorized_keys"
+snippet="$(bash -c 'source "$1"; source "$2"; printf "%s" "$AUTH_INSTALL_SNIPPET"' _ "$REPO_ROOT/core/lib.sh" "$REPO_ROOT/core/vps-auth.sh" 2>/dev/null)"
+echo 'ssh-ed25519 AAAANEW y' | HOME="$tmp/h" sh -c "$snippet" > /dev/null
+assert_eq $'ssh-ed25519 AAAAOLD x\nssh-ed25519 AAAANEW y' "$(cat "$tmp/h/.ssh/authorized_keys")" 'install snippet keeps keys apart'
+
 exit "$TESTS_FAILED"

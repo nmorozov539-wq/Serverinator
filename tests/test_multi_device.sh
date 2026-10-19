@@ -101,6 +101,13 @@ assert_eq 'owner_a_phone.pub ' "$got" 'only a_phone belongs to device a'
 echo "Test: orchestrator download hints"
 out="$(bash -c 'source "$1"; VPS_TARGET=root@203.0.113.9; DEVICE_NAME=rn9p; fetch_hint owner' _ "$REPO_ROOT/serverinator.sh")"
 assert_eq 'ssh root@203.0.113.9 si client-script owner --device rn9p > client-setup-owner-rn9p.sh && bash client-setup-owner-rn9p.sh' "$out" 'fetched through si on the VPS'
-out="$(bash -c 'source "$1"; VPS_TARGET=deploy@203.0.113.9; DEVICE_NAME=rn9p; fetch_hint_windows owner' _ "$REPO_ROOT/serverinator.sh")"
-assert_contains "$out" 'ssh deploy@203.0.113.9 si client-script owner --device rn9p --windows > client-setup-owner-rn9p.ps1' 'a sudo user too (si sudoes itself), Windows'
+out="$(bash -c 'source "$1"; VPS_TARGET=deploy@203.0.113.9; DEVICE_NAME=rn9p; windows_hint owner' _ "$REPO_ROOT/serverinator.sh")"
+assert_eq 'ssh deploy@203.0.113.9 si client-script owner --device rn9p > client-setup-owner-rn9p.sh ; powershell -ExecutionPolicy Bypass -File client-setup-windows.ps1 client-setup-owner-rn9p.sh' "$out" 'a sudo user too (si sudoes itself), Windows through the tool'
+
+# rn9 and rn9p share a prefix; counting peers by prefix mixed them up.
+echo "Test: a device name that prefixes another is counted apart"
+printf '# ServerInator peer: rn9p\n[Peer]\n# ServerInator peer: rn9\n[Peer]\n' > "$tmp/wg.conf"
+assert_eq 1 "$(bash -c 'source "$1"; peer_block_count "$2" rn9' _ "$VPS_SCRIPT" "$tmp/wg.conf" 2>/dev/null)" 'rn9 counted once'
+assert_eq 0 "$(bash -c 'source "$1"; peer_block_count "$2" phone' _ "$VPS_SCRIPT" "$tmp/wg.conf" 2>/dev/null)" 'unknown device counts zero'
+
 exit "$TESTS_FAILED"

@@ -18,9 +18,8 @@ WHERE="${1:-}"
 SI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SI_DIR/lib.sh"
 
-STATE_DIR="${SERVERINATOR_STATE_DIR:-/data/adb/serverinator}"
+STATE_DIR="${SERVERINATOR_STATE_DIR:-$SI_STATE_DIR_DEFAULT}"
 ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-$STATE_DIR/orchestrator}"
-CHROOT="${SERVERINATOR_CHROOT:-/data/serverinator-root}"
 VPS_SI="${SERVERINATOR_VPS_SI:-/usr/local/bin/si}"   # the VPS's launcher
 
 # Commands that run core-vps.sh on the VPS, and the flag each one becomes.
@@ -35,7 +34,6 @@ vps_flag() { # COMMAND -> FLAG (empty if not a VPS command)
         client-script) echo "--client-script*" ;;
         guests)        echo "--list-guests*" ;;
         add-guest)     echo "--add-guest*" ;;
-        guest-access)  echo "--guest-access*" ;;
         revoke-guest)  echo "--revoke-guest*" ;;
         sync-guests)   echo "--sync-guests*" ;;
         devices)       echo "--list-devices" ;;
@@ -64,8 +62,8 @@ si — ServerInator Core on this phone
 On the VPS, through SSH (this phone's device is filled in):
   si verify | si clients | si revoke-client LABEL
   si add-client LABEL [--pubkey KEY | --generate-key] [--expires 30d|DATE]
-  si client-script LABEL [--windows] > FILE    a client's setup script
-  si guests | si add-guest NAME [--folder F]... | si guest-access NAME --folder F...
+  si client-script LABEL > FILE    a client's setup script
+  si guests | si add-guest NAME --folder F | si add-guest NAME --shell
   si revoke-guest NAME | si sync-guests | si devices | si remove-device NAME
   si vps ARGS...                anything else core-vps.sh takes
 EOF
@@ -88,11 +86,11 @@ si — ServerInator Core on the VPS (runs core-vps.sh)
   si add-client LABEL --pubkey KEY|FILE    approve a device's own key
   si add-client LABEL --generate-key       the VPS makes the key (handed out once)
       ... --expires 30d|2026-12-31         the key stops working then
-  si client-script LABEL [--windows]       print a setup script (owner too)
+  si client-script LABEL        print a setup script (owner too)
   si revoke-client LABEL
-  si guests                     files-only guests
-  si add-guest NAME [--folder NAME|PATH[:ro|:rw]]... [--pubkey KEY|FILE]
-  si guest-access NAME --folder ...   replace a guest's folders
+  si guests                     guests: files only, or shell users
+  si add-guest NAME --folder NAME|PATH[:ro|:rw] [--pubkey KEY|FILE]   one folder, SFTP only
+  si add-guest NAME --shell [--pubkey KEY|FILE]   a Linux user on the phone, no root
   si revoke-guest NAME
   si sync-guests                after a phone reset
   si remove-device NAME
@@ -121,18 +119,17 @@ phone_vps_target() {
 
 # Runs the VPS's si with ARGS over serverinator.sh's SSH key.
 on_vps() {
-    local target key cmd="" a
+    local target key
     target="$(phone_vps_target)"
     key="$ORCHESTRATOR_SSH_DIR/id_ed25519"
     [[ -f "$key" ]] || die "No SSH key for the VPS at $key. Run: si setup"
-    for a in "$@"; do cmd+=" $(printf '%q' "$a")"; done
     # A terminal on both ends: ask for one, so VPS commands that ask
     # questions (si add-guest NAME) can (review B8).
     local tty=()
     [[ -t 0 && -t 1 ]] && tty=(-t)
     exec ssh ${tty[@]+"${tty[@]}"} -o BatchMode=yes -o "IdentityFile=$key" -o IdentitiesOnly=yes \
         -o "UserKnownHostsFile=$ORCHESTRATOR_SSH_DIR/known_hosts" -o ConnectTimeout=30 \
-        "$target" "$VPS_SI$cmd"
+        "$target" "$(remote_cmd "$VPS_SI" "$@")"
 }
 
 phone_logs() {

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Test stand-in for curl: the two downloads the install makes become marker
+# files naming what was asked for; everything else goes to the real curl.
+source "$(dirname "$0")/_real"
+orig=("$@") url="" out=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2; continue ;;
+        https://github.com/erebe/wstunnel/releases/*|https://cdimage.ubuntu.com/ubuntu-base/*) url="$1" ;;
+    esac
+    shift
+done
+if [[ -n "$url" && -n "$out" ]]; then
+    printf 'FAKE-DOWNLOAD %s\n' "${url##*/}" > "$out"
+    exit 0
+fi
+real curl "${orig[@]}"

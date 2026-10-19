@@ -27,6 +27,7 @@ assert_file_exists "$SERVERINATOR_SERVICE_D/personal.sh" 'personal service prese
 rc=0; bash "$PHONE_SCRIPT" --uninstall --purge --yes > "$tmp/out" 2>&1 || rc=$?
 assert_eq 0 "$rc" 'purge succeeds'
 assert_file_missing "$SERVERINATOR_SSH_HOSTKEY_DIR" 'explicit purge removes identity'
+assert_contains "$(cat "$tmp/out")" 'host keys removed too (--purge)' 'the summary says the keys went'
 export SERVERINATOR_DEV_ROOT="$tmp/vps"
 mkdir -p "$tmp/vps/etc/wireguard/serverinator" "$tmp/vps/etc/systemd/system" "$tmp/vps/usr/local/bin"
 touch "$tmp/vps/etc/wireguard/wg-si.conf" "$tmp/vps/etc/wireguard/awg0.conf" "$tmp/vps/etc/systemd/system/wstunnel-serverinator.service" "$tmp/vps/usr/local/bin/wstunnel" "$tmp/vps/usr/local/bin/personal"
@@ -50,4 +51,17 @@ unmount_chroot() { return 1; }
 rc=0; (uninstall_phone) > "$tmp/out" 2>&1 || rc=$?
 assert_eq 1 "$rc" 'failed unmount blocks deletion'
 assert_file_exists "$CHROOT/valuable" 'failed unmount preserves root'
+
+# The admin's own keys in the same authorized_keys must stay.
+echo "Test: VPS uninstall removes jump entries and nothing else"
+admin="$tmp/admin"; mkdir -p "$admin/.ssh"
+SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/u" SERVERINATOR_VPS_ADMIN_HOME="$admin" \
+    bash -c 'source "$1"; _authorize_vps_jump_key "ssh-ed25519 AAAAJUMP1 a" 10.66.69.2 2222
+        _authorize_vps_jump_key "ssh-ed25519 AAAAJUMP2 b" 10.66.69.3 2222' _ "$VPS_SCRIPT" > /dev/null 2>&1
+printf 'ssh-ed25519 AAAAMINE me@laptop\n' >> "$admin/.ssh/authorized_keys"
+SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/u" SERVERINATOR_VPS_ADMIN_HOME="$admin" bash "$VPS_SCRIPT" --uninstall --yes > "$tmp/u.log" 2>&1
+assert_eq 0 "$?" 'uninstall succeeds'
+assert_eq 'ssh-ed25519 AAAAMINE me@laptop' "$(cat "$admin/.ssh/authorized_keys")" 'only the jump entries are gone'
+assert_contains "$(cat "$tmp/u.log")" 'Removed ServerInator jump entries' 'reported'
+
 exit "$TESTS_FAILED"

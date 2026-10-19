@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stand-in for debootstrap: debootstrap [--arch=A] SUITE DIR [MIRROR]
+args=()
+for a in "$@"; do [[ "$a" == --* ]] || args+=("$a"); done
+dir="${args[1]:?debootstrap (test fake): no target}"
+mkdir -p "$dir"/{bin,etc,proc,sys,dev/pts,usr/bin,usr/local/bin}
+touch "$dir/bin/sh" "$dir/usr/bin/env" "$dir/usr/bin/dpkg" "$dir/etc/os-release"

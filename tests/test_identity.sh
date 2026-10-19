@@ -91,7 +91,7 @@ assert_contains "$ak" 'AAAAFRIEND' 'client key restored'
 assert_contains "$ak" 'AAAAHAND' 'hand-added key restored'
 in_phone "$new" 'merge_extra_keys "$CHROOT/root/.ssh/authorized_keys" "$IDENTITY_DIR/pending-extra-keys"' > /dev/null 2>&1
 assert_eq 1 "$(grep -c AAAAFRIEND "$new/root/root/.ssh/authorized_keys")" 'merging twice adds nothing'
-assert_contains "$(sed -n '/apply_ssh_config()/,/^}/p' "$PHONE_SCRIPT")" 'pending-extra-keys' 'apply_ssh_config merges pending keys'
+assert_contains "$(sed -n '/apply_ssh_config()/,/^}/p' "$REPO_ROOT/core/phone/sshd.sh")" 'pending-extra-keys' 'apply_ssh_config merges pending keys'
 
 echo "Test: importing the same identity again is harmless"
 rc=0; phone "$new" --import-identity "$out" > /dev/null 2>&1 || rc=$?

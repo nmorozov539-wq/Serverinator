@@ -29,14 +29,14 @@ source "$SCRIPT_DIR/core/vps-auth.sh"
 # read-only. Relying on default identity discovery (or ssh-copy-id) never
 # works on a phone, so we keep our own identity under a writable, persistent
 # path and pass it explicitly on every ssh/scp call.
-ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-/data/adb/serverinator/orchestrator}"
+ORCHESTRATOR_SSH_DIR="${SERVERINATOR_ORCHESTRATOR_SSH_DIR:-$SI_STATE_DIR_DEFAULT/orchestrator}"
 SSH_OPTS=()
 # Saved device name (see core-phone.sh IDENTITY_DIR).
-IDENTITY_DIR="${SERVERINATOR_IDENTITY_DIR:-/data/adb/serverinator/identity}"
+IDENTITY_DIR="${SERVERINATOR_IDENTITY_DIR:-$SI_STATE_DIR_DEFAULT/identity}"
 # The `si` command: a copy of these scripts in STATE_DIR/bin, and a Magisk
 # module that puts its launcher in /system/bin. DEV only with an explicit
 # modules folder.
-PHONE_STATE_DIR="${SERVERINATOR_STATE_DIR:-/data/adb/serverinator}"
+PHONE_STATE_DIR="${SERVERINATOR_STATE_DIR:-$SI_STATE_DIR_DEFAULT}"
 if [[ "$DEV" == "1" ]]; then
     MAGISK_MODULES_DIR="${SERVERINATOR_MODULES_DIR:-}"
 else
@@ -56,7 +56,6 @@ MODE="install"       # install|authorize|set-domain
 DOMAIN=""            # VPS domain for a real certificate ("" = keep the VPS's choice)
 ACME_EMAIL=""        # optional Let's Encrypt contact
 REMOVE_DOMAIN=0
-VPS_BIN_DIR="/root/.serverinator/bin"  # permanent script location on the VPS
 VPS_STATE_DIR="/etc/wireguard/serverinator"  # core-vps.sh's WG_KEY_DIR
 
 # Directory for temp files on the VPS (cleaned up on exit)
@@ -72,7 +71,7 @@ _cleanup() {
         rm -rf "$AUTH_TMP"
     fi
     if [[ -n "$VPS_TMP_DIR" && -n "$VPS_TARGET" ]]; then
-        _vps_cmd "rm -rf '${VPS_TMP_DIR}'" 2>/dev/null || true
+        _vps_cmd "$(remote_cmd rm -rf "$VPS_TMP_DIR")" 2>/dev/null || true
     fi
 }
 trap _cleanup EXIT
@@ -121,12 +120,18 @@ vps_push() {
     scp -q "${SSH_OPTS[@]}" "$src" "${VPS_TARGET}:${dest}"
 }
 
+# Copy a folder TO the VPS, as DEST_PARENT/<its name>.
+vps_push_dir() {
+    local src="$1" dest_parent="$2"
+    scp -q -r "${SSH_OPTS[@]}" "$src" "${VPS_TARGET}:${dest_parent}/"
+}
+
 # Copy a file FROM the VPS.
 vps_pull() {
     local src="$1" dest="$2"
     if [[ "$VPS_NEEDS_SUDO" == "1" ]]; then
         # The file may only be readable by root — read it via sudo cat
-        _vps_cmd "sudo cat '${src}'" > "$dest"
+        _vps_cmd "$(remote_cmd sudo cat "$src")" > "$dest"
     else
         scp -q "${SSH_OPTS[@]}" "${VPS_TARGET}:${src}" "$dest"
     fi
@@ -199,11 +204,15 @@ install_si_phone() {
     if [[ "$here" != "$(cd "$bin" && pwd -P)" ]]; then
         # Staged and swapped in, never copied over a file bash may be reading.
         stage="$(mktemp -d "$bin/.stage.XXXXXX")"
-        mkdir "$stage/core"
+        mkdir "$stage/core" "$stage/core/phone" "$stage/core/vps" "$stage/core/templates"
         for f in core/core-phone.sh core/lib.sh core/vps-auth.sh core/core-vps.sh \
                  core/guest-helper.sh core/motd.bash core/si; do
             [[ -f "$SCRIPT_DIR/$f" ]] || die "Missing $SCRIPT_DIR/$f"
             cp "$SCRIPT_DIR/$f" "$stage/$f"
+        done
+        for f in "$SCRIPT_DIR"/core/phone/*.sh "$SCRIPT_DIR"/core/vps/*.sh "$SCRIPT_DIR"/core/templates/*; do
+            [[ -f "$f" ]] || die "Missing $f"
+            cp "$f" "$stage/core/${f#"$SCRIPT_DIR"/core/}"
         done
         cp "$SCRIPT_DIR/serverinator.sh" "$stage/serverinator.sh"
         chmod -R go-rwx "$stage"
@@ -329,14 +338,13 @@ split_vps_target() {
 # tmpfs on phones with at least 3 GB of RAM and disk below that.
 ask_chroot_tmp() {
     [[ -z "$CHROOT_TMP" ]] || return 0
-    local saved="${SERVERINATOR_STATE_DIR:-/data/adb/serverinator}/chroot-tmp-mode" def ram
-    ram="$(awk '$1=="MemTotal:" {print int($2/1024)}' /proc/meminfo 2>/dev/null || true)"
+    local saved="${SERVERINATOR_STATE_DIR:-$SI_STATE_DIR_DEFAULT}/chroot-tmp-mode" def ram
+    ram="$(total_ram_mb)"
+    [[ "$ram" != 0 ]] || ram=""
     if [[ -f "$saved" ]]; then
         def="$(cat "$saved")"
-    elif (( ${ram:-0} >= 3072 )); then
-        def=tmpfs
     else
-        def=disk
+        def="$(default_chroot_tmp_mode)"
     fi
     [[ "$def" == tmpfs || "$def" == disk ]] || def=disk
     if [[ -t 0 ]]; then
@@ -409,11 +417,11 @@ step_phone_setup() {
 step_vps_setup() {
     section 2/5 "Copying files to the VPS and running setup"
 
-    # Temp directory on the VPS (holds core-vps.sh + lib.sh + handoff.json)
+    # Temp directory on the VPS (holds core-vps.sh, vps/, templates/, lib.sh and handoff.json)
     VPS_TMP_DIR="$(_vps_cmd 'mktemp -d /tmp/serverinator.XXXXXX')"
     [[ -n "$VPS_TMP_DIR" ]] || die "Could not create a temp directory on the VPS"
 
-    local handoff_path="${SERVERINATOR_CHROOT:-/data/serverinator-root}/etc/wireguard/handoff.json"
+    local handoff_path="${SERVERINATOR_CHROOT:-$SI_CHROOT_DEFAULT}/etc/wireguard/handoff.json"
     [[ -f "$handoff_path" ]] || die "handoff.json not found: $handoff_path (did step 1 finish correctly?)"
 
     push_vps_scripts
@@ -421,18 +429,19 @@ step_vps_setup() {
     # First, so `si` is on the VPS even if setup stops halfway.
     install_vps_scripts
 
-    # Build core-vps.sh's arguments
-    local vps_args="$VPS_TMP_DIR/handoff.json --vps-ip $VPS_HOST --alias $SSH_ALIAS"
-    [[ -z "$CLIENT_KEYS_MODE" ]] || vps_args="$vps_args --client-keys $CLIENT_KEYS_MODE"
-    vps_args="$vps_args$(domain_args)"
-
-    run_core_vps "$vps_args"
+    # core-vps.sh's arguments
+    local vps_args=("$VPS_TMP_DIR/handoff.json" --vps-ip "$VPS_HOST" --alias "$SSH_ALIAS") extra=()
+    [[ -z "$CLIENT_KEYS_MODE" ]] || vps_args+=(--client-keys "$CLIENT_KEYS_MODE")
+    read -ra extra <<< "$(domain_args)"
+    run_core_vps "${vps_args[@]}" ${extra[@]+"${extra[@]}"}
 }
 
 push_vps_scripts() {
     vps_push "$SCRIPT_DIR/core/lib.sh"      "$VPS_TMP_DIR/lib.sh"
     vps_push "$SCRIPT_DIR/core/core-vps.sh" "$VPS_TMP_DIR/core-vps.sh"
     vps_push "$SCRIPT_DIR/core/si"          "$VPS_TMP_DIR/si"
+    vps_push_dir "$SCRIPT_DIR/core/vps"     "$VPS_TMP_DIR"
+    vps_push_dir "$SCRIPT_DIR/core/templates" "$VPS_TMP_DIR"
 }
 
 # core-vps.sh's domain arguments (each value validated in parse_args/ask_domain).
@@ -446,34 +455,32 @@ domain_args() {
 # Runs the pushed core-vps.sh with ARGS. Its ssh session has no tty, so
 # carry our colour choice over explicitly (env, not sudo VAR=, which some
 # sudoers refuse).
-run_core_vps() { # ARGS
-    local color=never
+run_core_vps() { # ARGS...
+    local color=never as_root=()
     [[ "$SI_COLOR_ON" == 1 ]] && color=always
-    if [[ "$VPS_NEEDS_SUDO" == "1" ]]; then
-        _vps_cmd "sudo env SERVERINATOR_COLOR=$color bash $VPS_TMP_DIR/core-vps.sh $1"
-    else
-        _vps_cmd "env SERVERINATOR_COLOR=$color bash $VPS_TMP_DIR/core-vps.sh $1"
-    fi
+    [[ "$VPS_NEEDS_SUDO" == "1" ]] && as_root=(sudo)
+    _vps_cmd "$(remote_cmd ${as_root[@]+"${as_root[@]}"} env "SERVERINATOR_COLOR=$color" bash "$VPS_TMP_DIR/core-vps.sh" "$@")"
 }
 
 install_vps_scripts() {
     # Install the scripts in a permanent location on the VPS (for --verify and future runs)
     # /root/.serverinator/bin/ — alongside the rest of ServerInator's data —
     # and the `si` launcher in /usr/local/bin (it sudoes itself for non-root).
-    local vps_bin="/root/.serverinator/bin" sudo=""
+    local vps_bin="/root/.serverinator/bin" sudo="" b t
     [[ "$VPS_NEEDS_SUDO" == "1" ]] && sudo="sudo "
-    _vps_cmd "${sudo}mkdir -p '$vps_bin' && \
-        ${sudo}cp '$VPS_TMP_DIR/core-vps.sh' '$VPS_TMP_DIR/lib.sh' '$VPS_TMP_DIR/si' '$vps_bin/' && \
-        ${sudo}chmod 700 '$vps_bin' && \
-        ${sudo}chmod 600 '$vps_bin/core-vps.sh' '$vps_bin/lib.sh' '$vps_bin/si'"
+    b="$(remote_cmd "$vps_bin")" t="$(remote_cmd "$VPS_TMP_DIR")"
+    _vps_cmd "${sudo}mkdir -p $b && \
+        ${sudo}cp $t/core-vps.sh $t/lib.sh $t/si $b/ && \
+        ${sudo}rm -rf $b/vps $b/templates && ${sudo}cp -r $t/vps $t/templates $b/ && \
+        ${sudo}chmod 700 $b $b/vps $b/templates && \
+        ${sudo}chmod 600 $b/core-vps.sh $b/lib.sh $b/si $b/vps/* $b/templates/*"
     _vps_cmd "${sudo}tee /usr/local/bin/si.new > /dev/null && ${sudo}chmod 755 /usr/local/bin/si.new && \
         ${sudo}mv -f /usr/local/bin/si.new /usr/local/bin/si" << EOF
 #!/bin/sh
 # ServerInator: the si command (managed). Needs root; uses sudo otherwise.
 [ "\$(id -u)" = 0 ] || exec sudo "\$0" "\$@"
-exec bash $vps_bin/si vps "\$@"
+exec bash $b/si vps "\$@"
 EOF
-    VPS_BIN_DIR="$vps_bin"
 }
 
 step_apply_back_handoff() { # [FETCH_SECTION APPLY_SECTION]
@@ -572,10 +579,11 @@ fetch_hint() { # LABEL
     printf '%s' "ssh $VPS_TARGET si client-script $1 --device $DEVICE_NAME > $name && bash $name"
 }
 
-# The same for Windows PowerShell.
-fetch_hint_windows() { # LABEL
-    local name="client-setup-$1-${DEVICE_NAME}.ps1"
-    printf '%s' "ssh $VPS_TARGET si client-script $1 --device $DEVICE_NAME --windows > $name ; powershell -ExecutionPolicy Bypass -File .\\$name"
+# The same on Windows: fetch the bash script, and let
+# tools/client-setup-windows.ps1 (from this repo) apply it. Untested so far.
+windows_hint() { # LABEL
+    local name="client-setup-$1-${DEVICE_NAME}.sh"
+    printf '%s' "ssh $VPS_TARGET si client-script $1 --device $DEVICE_NAME > $name ; powershell -ExecutionPolicy Bypass -File client-setup-windows.ps1 $name"
 }
 
 # Moves an existing install to DOMAIN (or back to the IP): the VPS gets the
@@ -593,7 +601,7 @@ run_set_domain() {
     saved_device_name
     [[ -n "$DEVICE_NAME" ]] || die "No saved device name on this phone; pass --device-name NAME"
     validate_device_name "$DEVICE_NAME"
-    [[ -f "${SERVERINATOR_CHROOT:-/data/serverinator-root}/etc/wireguard/client.pub" ]] \
+    [[ -f "${SERVERINATOR_CHROOT:-$SI_CHROOT_DEFAULT}/etc/wireguard/client.pub" ]] \
         || die "This phone has no ServerInator install yet; run the normal setup with --domain instead"
 
     SECONDS=0
@@ -607,7 +615,9 @@ run_set_domain() {
     [[ -n "$VPS_TMP_DIR" ]] || die "Could not create a temp directory on the VPS"
     push_vps_scripts
     install_vps_scripts
-    run_core_vps "$(domain_args)"
+    local extra=()
+    read -ra extra <<< "$(domain_args)"
+    run_core_vps "${extra[@]}"
 
     step_apply_back_handoff 2/4 3/4
     step_wss_preflight 4/4 || true
@@ -696,7 +706,7 @@ main() {
     echo "  SSH access for your main computer (the owner key; the script carries"
     echo "  it and can be fetched once, then the VPS keeps only the public key):"
     echo "    $(fetch_hint owner)"
-    echo "    Windows: $(fetch_hint_windows owner)"
+    echo "    Windows (untested): $(windows_hint owner)"
     echo ""
     echo "  Each other device gets a key of its own (once the tunnel is up):"
     echo "    si add-client LABEL          prints how to pair that device"

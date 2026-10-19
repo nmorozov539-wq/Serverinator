@@ -2,6 +2,8 @@
 # ServerInator — shared library
 # Include via: source "$(dirname "$0")/lib.sh"
 # Do not run directly.
+# The settings here are for the scripts that source this file:
+# shellcheck disable=SC2034
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     echo "lib.sh: do not run directly — source it instead" >&2
@@ -24,6 +26,30 @@ unset _si_dir
 
 # The release, shown by --version and si version. Bumped with each one.
 SERVERINATOR_VERSION="2026.10.18"
+
+# ── Shared settings ────────────────────────────
+# Defined once here; each script still honours its SERVERINATOR_* override.
+
+# wstunnel on both ends. v11.0.0 fixes reverse-tunnel idle reconnect,
+# TCP_NODELAY stalls and dispatch speed (see upstream changelog). The working
+# reference setup used 11.0.0.
+WSTUNNEL_VERSION="11.0.0"
+
+# Where ServerInator keeps its state on the phone (keys, logs, backups, the
+# si copy), and where the chroot lives.
+SI_STATE_DIR_DEFAULT="/data/adb/serverinator"
+SI_CHROOT_DEFAULT="/data/serverinator-root"
+
+# Total RAM in MiB (0 if unknown).
+total_ram_mb() {
+    awk '$1=="MemTotal:" {print int($2/1024); found=1} END {if(!found) print 0}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+# The chroot's /tmp on a first install: tmpfs only when RAM is comfortably
+# large (3 GB), disk below that.
+default_chroot_tmp_mode() {
+    if (( $(total_ram_mb) >= 3072 )); then echo tmpfs; else echo disk; fi
+}
 
 # print_usage SCRIPT: the comment block at the top of SCRIPT (between the
 # first two ─── rules), without the leading "# ".
@@ -104,6 +130,16 @@ confirm_destructive() {
 no_answer() { die "No answer to \"$1\": the input ended. ${2:-Run it in a terminal.}"; }
 require_cmd() { have_cmd "$1" || die "Command not found: $1"; }
 
+# remote_cmd WORD...: one command line for a remote shell (ssh joins its
+# arguments and the far side's shell splits them again). Each word is quoted
+# with printf %q, so it arrives as the same word. Values are still validated
+# before they get here; this is the second layer.
+remote_cmd() {
+    local line
+    line="$(printf '%q ' "$@")"
+    printf '%s' "${line% }"
+}
+
 # ── File management ────────────────────────────
 #
 # reconcile_file TARGET MODE [BACKUP_DIR]
@@ -123,7 +159,8 @@ reconcile_file() {
     local target_dir
     target_dir="$(dirname "$target")"
     local backup_dir="${3:-$target_dir}"
-    local backup="$backup_dir/$(basename "$target").bak"
+    local backup
+    backup="$backup_dir/$(basename "$target").bak"
     local desired
 
     mkdir -p "$target_dir" "$backup_dir"
@@ -247,8 +284,6 @@ validate_ipv4() {
     done
 }
 
-# A DNS name for a certificate: a hostname with at least one dot, not an IP,
-# lower-cased by the caller. Wildcards aren't accepted.
 # An e-mail address for Let's Encrypt notices. Restricted to characters
 # that are safe in a remote shell command line.
 validate_email() {
@@ -256,6 +291,8 @@ validate_email() {
         || die "Invalid e-mail address: '$1'"
 }
 
+# A DNS name for a certificate: a hostname with at least one dot, not an IP,
+# lower-cased by the caller. Wildcards aren't accepted.
 validate_domain() {
     local d="$1"
     [[ -n "$d" && "$d" == *.* && ! "$d" =~ ^[0-9.]+$ && "$d" =~ ^[a-z0-9.-]+$ ]] \
@@ -384,6 +421,26 @@ safe_remove_path() {
             die "Rejected overly broad path for removal: '$path'"
             ;;
     esac
+}
+
+# ── Templates ──────────────────────────────────
+# Generated scripts and configs live in core/templates/ with @NAME@ markers.
+
+# render_template FILE NAME=VALUE...: prints FILE with every @NAME@ replaced
+# by VALUE. Values go in as they are, so they must be validated already. A
+# marker without a value is refused, so nothing goes out half filled.
+render_template() {
+    local file="$1" text pair name; shift
+    [[ -f "$file" ]] || die "Template not found: $file"
+    text="$(cat "$file"; printf x)"
+    text="${text%x}"
+    for pair in "$@"; do
+        name="${pair%%=*}"
+        [[ "$pair" == *=* && "$name" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "render_template: bad argument '$pair'"
+        text="${text//"@$name@"/"${pair#*=}"}"
+    done
+    [[ ! "$text" =~ @[A-Z][A-Z0-9_]*@ ]] || die "render_template: no value for ${BASH_REMATCH[0]} in $file"
+    printf '%s' "$text"
 }
 
 # ── Magisk launchers (phone) ──────────────────

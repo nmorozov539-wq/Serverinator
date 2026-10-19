@@ -16,4 +16,11 @@ done
 for w in phone chroot vps; do
     assert_eq "ServerInator $ver" "$(bash "$REPO_ROOT/core/si" "$w" version 2>&1)" "si version ($w)"
 done
+
+# A stray word used to loop forever in parse_args.
+echo "Test: core-phone.sh refuses a stray word instead of looping"
+rc=0; out="$(timeout 10 bash "$PHONE_SCRIPT" foo 2>&1)" || rc=$?
+assert_eq 1 "$rc" 'exits with an error (not a hang: 124)'
+assert_contains "$out" 'Unknown argument: foo' 'names it'
+
 exit "$TESTS_FAILED"

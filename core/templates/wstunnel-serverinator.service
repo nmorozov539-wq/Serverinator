@@ -1,0 +1,41 @@
+[Unit]
+Description=wstunnel server for ServerInator
+After=network.target
+
+[Service]
+# Certificate: @CERTIFICATE@
+@CRED_LINES@EnvironmentFile=@WG_KEY_DIR@/wstunnel.env
+ExecStart=@WSTUNNEL_BIN@ server \
+    --log-lvl INFO \
+    --restrict-to @WG_RESTRICT_TARGET@ \
+@TLS_LINES@    wss://0.0.0.0:@WSTUNNEL_PORT@
+Restart=on-failure
+RestartSec=5
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

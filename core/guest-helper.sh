@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
-# ServerInator — guest file access, phone side.
+# ServerInator — guests, phone side.
 #
 # Installed by core-phone.sh as /usr/local/sbin/serverinator-guests inside
 # the chroot. The VPS runs it over its root SSH key (core-vps.sh
-# --add-guest/--guest-access/--revoke-guest/--sync-guests), and the sshd
-# autostart runs `mount-all` before sshd starts.
+# --add-guest/--revoke-guest/--sync-guests), and the sshd autostart runs
+# `mount-all` before sshd starts.
 #
-# A guest is a Linux user in the serverinator-guests group. sshd (see
-# /etc/ssh/serverinator-guests.conf) gives that group internal-sftp only,
-# chrooted to the guest's room /srv/guests/NAME. The room is root-owned
-# and holds nothing but mount points: every folder the guest may use is
-# bind-mounted into it, read-only or read-write per folder. Read-only is a
-# property of the mount, so the guest can't get around it.
+# A guest is one of two kinds of Linux user (see
+# /etc/ssh/serverinator-guests.conf for the sshd side):
+#
+#   files  in the serverinator-guests group: internal-sftp only, chrooted to
+#          the guest's room /srv/guests/NAME. The room is root-owned and holds
+#          one mount point: the guest's folder, bind-mounted read-only or
+#          read-write. Read-only is a property of the mount, so the guest
+#          can't get around it. The key here is the VPS's route key.
+#   shell  in the serverinator-shell group: a normal user with a home folder
+#          and bash, who sees the whole chroot through ordinary permissions.
+#          No root, no sudo. The key here is the guest's own key; the guest
+#          jumps through the VPS to reach it.
 #
 # Usage (as root, inside the chroot):
-#   serverinator-guests set NAME [--uid UID] [--from IP] MODE:PATH...
-#       (route public key on stdin; MODE is ro or rw; prints uid=N)
+#   serverinator-guests set NAME [--uid UID] [--from IP] MODE:PATH
+#       (files guest: route public key on stdin; MODE is ro or rw; prints uid=N)
+#   serverinator-guests set NAME [--uid UID] [--from IP] --shell
+#       (shell guest: the guest's public key on stdin; prints uid=N)
 #   serverinator-guests remove NAME
 #   serverinator-guests mount-all
 #   serverinator-guests names
@@ -23,9 +31,11 @@
 #   serverinator-guests version
 set -euo pipefail
 
-SI_GUESTS_VERSION=1
+SI_GUESTS_VERSION=2
 GUEST_GROUP="serverinator-guests"
 GUEST_GID_PREFERRED=2000
+SHELL_GROUP="serverinator-shell"
+SHELL_GID_PREFERRED=1999
 GUEST_UID_MIN=2001
 GUEST_UID_MAX=2999
 
@@ -86,7 +96,8 @@ parse_spec() { # SPEC -> sets SPEC_MODE SPEC_PATH
 # One file per guest, STATE_DIR/NAME:
 #   uid 2001
 #   from 10.66.69.1
-#   folder rw /srv/files/photos
+#   mode files            (or shell; files when missing, as version 1 wrote)
+#   folder rw /srv/files/photos   (files guests only)
 
 state_file() { printf '%s/%s\n' "$STATE_DIR" "$1"; }
 
@@ -104,19 +115,38 @@ state_get() { # NAME KEY
     awk -v k="$2" '$1 == k {print $2; exit}' "$(state_file "$1")"
 }
 
+state_mode() { # NAME -> files|shell
+    local m
+    m="$(state_get "$1" mode)"
+    [[ "$m" == shell ]] && echo shell || echo files
+}
+
 state_folders() { # NAME -> "MODE PATH" lines
     awk '$1 == "folder" && ($2 == "ro" || $2 == "rw") {print $2" "$3}' "$(state_file "$1")"
 }
 
 # ── Users ──────────────────────────────────────
 
-ensure_group() {
-    getent group "$GUEST_GROUP" >/dev/null && return 0
-    if getent group "$GUEST_GID_PREFERRED" >/dev/null; then
-        groupadd "$GUEST_GROUP"
+ensure_group() { # GROUP PREFERRED_GID
+    getent group "$1" >/dev/null && return 0
+    if getent group "$2" >/dev/null; then
+        groupadd "$1"
     else
-        groupadd -g "$GUEST_GID_PREFERRED" "$GUEST_GROUP"
+        groupadd -g "$2" "$1"
     fi
+}
+
+group_gid() { getent group "$1" | cut -d: -f3 || true; }
+
+# files|shell for a guest account, empty for any other user.
+user_kind() { # NAME
+    local gid
+    gid="$(getent passwd "$1" | cut -d: -f4)" || return 0
+    [[ -n "$gid" ]] || return 0
+    if [[ "$gid" == "$(group_gid "$GUEST_GROUP")" ]]; then echo files
+    elif [[ "$gid" == "$(group_gid "$SHELL_GROUP")" ]]; then echo shell
+    fi
+    return 0
 }
 
 lowest_free_uid() {
@@ -127,15 +157,16 @@ lowest_free_uid() {
     die "No free guest UID left ($GUEST_UID_MIN-$GUEST_UID_MAX)"
 }
 
-# ensure_user NAME [UID] -> prints the UID in use.
+# ensure_user NAME files|shell [UID] -> prints the UID in use.
 ensure_user() {
-    local name="$1" want="${2:-}" entry uid gid group_gid
-    group_gid="$(getent group "$GUEST_GROUP" | cut -d: -f3)"
+    local name="$1" kind="$2" want="${3:-}" entry uid have
     if entry="$(getent passwd "$name")"; then
         uid="$(cut -d: -f3 <<< "$entry")"
-        gid="$(cut -d: -f4 <<< "$entry")"
-        [[ "$gid" == "$group_gid" ]] \
+        have="$(user_kind "$name")"
+        [[ -n "$have" ]] \
             || die "A user named '$name' already exists on the phone and isn't a guest; pick another name"
+        [[ "$have" == "$kind" ]] \
+            || die "'$name' is a $have guest on the phone; remove it first to make it a $kind guest"
         [[ -z "$want" || "$want" == "$uid" ]] \
             || die "Guest '$name' has UID $uid on the phone, but the VPS expects $want"
     else
@@ -146,8 +177,13 @@ ensure_user() {
         else
             uid="$(lowest_free_uid)"
         fi
-        useradd -u "$uid" -g "$GUEST_GROUP" -d / -M -s /usr/sbin/nologin \
-            -c "ServerInator guest" "$name"
+        if [[ "$kind" == shell ]]; then
+            useradd -u "$uid" -g "$SHELL_GROUP" -d "/home/$name" -m -s /bin/bash \
+                -c "ServerInator shell guest" "$name"
+        else
+            useradd -u "$uid" -g "$GUEST_GROUP" -d / -M -s /usr/sbin/nologin \
+                -c "ServerInator guest" "$name"
+        fi
     fi
     # sshd here runs with UsePAM no, which refuses a locked account ("!").
     # "*" means: no password can ever match, but the account isn't locked.
@@ -237,40 +273,39 @@ mount_guest() { # NAME
 # ── Commands ───────────────────────────────────
 
 cmd_set() {
-    local name="${1:-}" uid="" from="" spec key seen="" base
+    local name="${1:-}" uid="" from="" kind=files spec="" key
     [[ -n "$name" ]] || die "set: NAME required"
     valid_name "$name" || die "Invalid guest name '$name'"
     shift
-    local -a specs=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --uid)  uid="${2:-}"; shift 2 || die "--uid needs a value"
-                    valid_uid "$uid" || die "Invalid UID '$uid'" ;;
-            --from) from="${2:-}"; shift 2 || die "--from needs an IP"
-                    valid_ipv4 "$from" || die "Invalid --from IP '$from'" ;;
-            *)      specs+=("$1"); shift ;;
+            --uid)   uid="${2:-}"; shift 2 || die "--uid needs a value"
+                     valid_uid "$uid" || die "Invalid UID '$uid'" ;;
+            --from)  from="${2:-}"; shift 2 || die "--from needs an IP"
+                     valid_ipv4 "$from" || die "Invalid --from IP '$from'" ;;
+            --shell) kind=shell; shift ;;
+            *)       [[ -z "$spec" ]] || die "set: one folder per guest"
+                     spec="$1"; shift ;;
         esac
     done
-    ((${#specs[@]} > 0)) || die "set: at least one folder required"
-    for spec in "${specs[@]}"; do
+    if [[ "$kind" == shell ]]; then
+        [[ -z "$spec" ]] || die "set: a shell guest has no folder"
+    else
+        [[ -n "$spec" ]] || die "set: a folder (ro:PATH or rw:PATH) or --shell is required"
         parse_spec "$spec"
-        base="${SPEC_PATH##*/}"
-        [[ " $seen " != *" $base "* ]] \
-            || die "Two folders are both called '$base'; a guest sees folders by name, so names must differ"
-        seen="$seen $base"
-    done
+    fi
 
     IFS= read -r key || true
     key="${key%$'\r'}"
-    valid_pubkey "$key" || die "set: expected the route key (ssh-ed25519) on stdin"
+    valid_pubkey "$key" || die "set: expected a public key (ssh-ed25519) on stdin"
 
-    ensure_group
-    uid="$(ensure_user "$name" "$uid")"
-
-    for spec in "${specs[@]}"; do
-        parse_spec "$spec"
-        prepare_source "$SPEC_MODE" "$SPEC_PATH"
-    done
+    if [[ "$kind" == shell ]]; then
+        ensure_group "$SHELL_GROUP" "$SHELL_GID_PREFERRED"
+    else
+        ensure_group "$GUEST_GROUP" "$GUEST_GID_PREFERRED"
+    fi
+    uid="$(ensure_user "$name" "$kind" "$uid")"
+    [[ "$kind" == shell ]] || prepare_source "$SPEC_MODE" "$SPEC_PATH"
 
     # State first, then mounts from it (mount-all at boot does the same).
     mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
@@ -279,25 +314,28 @@ cmd_set() {
     {
         printf 'uid %s\n' "$uid"
         [[ -z "$from" ]] || printf 'from %s\n' "$from"
-        for spec in "${specs[@]}"; do
-            parse_spec "$spec"
-            printf 'folder %s %s\n' "$SPEC_MODE" "$SPEC_PATH"
-        done
+        printf 'mode %s\n' "$kind"
+        [[ "$kind" == shell ]] || printf 'folder %s %s\n' "$SPEC_MODE" "$SPEC_PATH"
     } > "$tmp"
     chmod 600 "$tmp"
     mv "$tmp" "$(state_file "$name")"
 
-    local room
-    room="$(make_room "$name")"
-    unmount_room "$room"
-    clear_room "$room"
-    mount_guest "$name"
+    if [[ "$kind" == files ]]; then
+        local room
+        room="$(make_room "$name")"
+        unmount_room "$room"
+        clear_room "$room"
+        mount_guest "$name"
+    fi
 
-    # The route key is accepted only for this user and, when known, only
-    # from the VPS's tunnel address.
+    # The key is accepted only for this user and, when known, only from the
+    # VPS's tunnel address. A shell guest needs a terminal; sshd's rules for
+    # the group still turn forwarding off.
+    local opts="restrict" tag="serverinator-route"
+    [[ "$kind" == files ]] || { opts="restrict,pty"; tag="serverinator-guest"; }
     mkdir -p "$KEYS_DIR"; chown root:root "$KEYS_DIR"; chmod 755 "$KEYS_DIR"
     tmp="$(mktemp "$KEYS_DIR/.${name}.XXXXXX")"
-    printf 'restrict%s %s serverinator-route:%s\n' "${from:+,from=\"$from\"}" "$key" "$name" > "$tmp"
+    printf '%s%s %s %s:%s\n' "$opts" "${from:+,from=\"$from\"}" "$key" "$tag" "$name" > "$tmp"
     chmod 644 "$tmp"
     mv "$tmp" "$KEYS_DIR/$name"
 
@@ -315,15 +353,15 @@ cmd_remove() {
         rmdir "$room" 2>/dev/null || warn "$room is not empty; left in place"
     fi
     if getent passwd "$name" >/dev/null; then
-        local gid group_gid
-        gid="$(getent passwd "$name" | cut -d: -f4)"
-        group_gid="$(getent group "$GUEST_GROUP" | cut -d: -f3 || true)"
-        if [[ "$gid" == "$group_gid" ]]; then
-            pkill -KILL -u "$name" 2>/dev/null || true
-            userdel "$name"
-        else
-            warn "User '$name' isn't a guest; not removing the account"
-        fi
+        case "$(user_kind "$name")" in
+            files) pkill -KILL -u "$name" 2>/dev/null || true
+                   userdel "$name" ;;
+            # The home folder is the guest's own; a later guest may get the
+            # same UID, so it must not stay behind.
+            shell) pkill -KILL -u "$name" 2>/dev/null || true
+                   userdel -r "$name" 2>/dev/null || userdel "$name" ;;
+            *)     warn "User '$name' isn't a guest; not removing the account" ;;
+        esac
     fi
     rm -f "$(state_file "$name")"
     say "removed $name"
@@ -332,14 +370,20 @@ cmd_remove() {
 cmd_mount_all() {
     local name
     while IFS= read -r name; do
-        mount_guest "$name" || warn "Could not mount the folders of $name"
+        [[ "$(state_mode "$name")" == files ]] || continue
+        mount_guest "$name" || warn "Could not mount the folder of $name"
     done < <(state_names)
 }
 
 cmd_list() {
     local name mode src size
     while IFS= read -r name; do
-        printf '%s uid=%s\n' "$name" "$(state_get "$name" uid)"
+        printf '%s uid=%s %s\n' "$name" "$(state_get "$name" uid)" "$(state_mode "$name")"
+        if [[ "$(state_mode "$name")" == shell ]]; then
+            size="$(du -sh "/home/$name" 2>/dev/null | cut -f1 || true)"
+            printf '  home /home/%s %s\n' "$name" "${size:-missing}"
+            continue
+        fi
         while read -r mode src; do
             size="$(du -sh "$src" 2>/dev/null | cut -f1 || true)"
             printf '  %s %s %s\n' "$mode" "$src" "${size:-missing}"

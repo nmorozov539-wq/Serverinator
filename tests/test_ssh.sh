@@ -194,7 +194,8 @@ run_snippet() { # $1 = existing|new
                  CLIENT_KEYS_MODE="'"$1"'"
                  setup_vps_ssh_keys >/dev/null
                  generate_client_setup >/dev/null
-                 cat "$SSH_KEY_DIR/client-setup-owner-rn9p.sh"' _ "$VPS_SCRIPT" 2>&1
+                 cp "$SSH_KEY_DIR/client-setup-owner-rn9p.sh" "'"$tmp"'/snippet.sh"' _ "$VPS_SCRIPT" > /dev/null 2>&1
+    client_setup_result "$tmp/snippet.sh"
 }
 
 echo "Test: client snippet uses default alias and ProxyJump (existing key)"
@@ -212,11 +213,112 @@ assert_not_contains "$out" "IdentityFile" "no IdentityFile for existing key"
 echo "Test: client snippet provides a private file path without secret output"
 rm -rf "$tmp/s"
 out="$(run_snippet new)"
-assert_contains "$out" 'KEY="$HOME/.ssh/si-rn9p"' "key file for the new key"
+assert_contains "$out" 'IdentityFile ' "key file for the new key"
+assert_contains "$out" '/.ssh/si-rn9p' "named after the phone"
 assert_not_contains "$out" "PRIVATE KEY" "private key is never printed"
-assert_contains "$out" "base64 -d" "script carries the key to install"
+assert_contains "$out" "Key installed: " "script carries the key to install"
 assert_eq 600 "$(stat -c %a "$tmp/s/keys/owner_rn9p")" "private key permissions"
 if ssh-keygen -y -f "$tmp/s/keys/owner_rn9p" >/dev/null; then
  pass "saved private key parses with ssh-keygen"
 else failtest "saved key does not parse"; fi
+
+# Revoking the last jump key must still work when nothing is left to write.
+echo "Test: revoking the only jump entry leaves an empty file"
+mkdir -p "$tmp/admin/.ssh"
+rc=0
+SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$tmp/dev" SERVERINATOR_VPS_ADMIN_HOME="$tmp/admin" \
+    bash -c 'source "$1"
+        _authorize_vps_jump_key "ssh-ed25519 AAAAONLY x" 10.66.69.2 2222
+        _revoke_vps_jump_key "ssh-ed25519 AAAAONLY x" 10.66.69.2 2222' _ "$VPS_SCRIPT" > "$tmp/revoke.log" 2>&1 || rc=$?
+assert_eq 0 "$rc" 'revocation succeeds when no lines remain'
+assert_eq 0 "$(stat -c %s "$tmp/admin/.ssh/authorized_keys")" 'file emptied'
+assert_eq "" "$(find "$tmp/admin/.ssh" -name 'authorized_keys.*')" 'no temp files left behind'
+
+# The phone's host key travels in the handoff, so neither the VPS nor the
+# owner's devices trust whatever key answers first.
+echo "Test: phone host key is pinned end to end"
+ssh-keygen -q -t ed25519 -N '' -C phone-host -f "$tmp/phone_host" >/dev/null
+ssh-keygen -q -t ed25519 -N '' -C vps-host -f "$tmp/vps_host" >/dev/null
+ssh-keygen -q -t ed25519 -N '' -C other -f "$tmp/other_host" >/dev/null
+host_pub="$(cut -d' ' -f1,2 "$tmp/phone_host.pub")"
+host_fp="$(ssh-keygen -lf "$tmp/phone_host.pub" | awk '{print $2}')"
+devroot="$tmp/vps"; key_dir="$devroot/etc/wireguard/serverinator/ssh"
+handoff() { # FILE PUBKEY FINGERPRINT
+    cat > "$1" <<JSON
+{"version":1,"device_name":"rn9p","wg_pubkey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","wstunnel_port":9443,"wg_port":51822,"ssh_enabled":1,"ssh_user":"root","ssh_port":2222,"ssh_host_fingerprint":"$3","ssh_host_pubkey":"$2"}
+JSON
+}
+vps() {
+    SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$devroot" SERVERINATOR_VPS_HOSTKEY_FILE="$tmp/vps_host.pub" \
+        bash -c 'source "$1"; shift; main "$@"' _ "$VPS_SCRIPT" "$@"
+}
+handoff "$tmp/bad.json" "$(cut -d' ' -f1,2 "$tmp/other_host.pub")" "$host_fp"
+vps "$tmp/bad.json" --vps-ip 203.0.113.9 > "$tmp/bad.log" 2>&1
+assert_eq 1 "$?" 'host key that does not match the fingerprint refused'
+assert_contains "$(cat "$tmp/bad.log")" "doesn't match ssh_host_fingerprint" 'explains the mismatch'
+handoff "$tmp/opt.json" "ssh-ed25519 AAAA x\nssh-rsa AAAA" ""
+vps "$tmp/opt.json" --vps-ip 203.0.113.9 > "$tmp/opt.log" 2>&1
+assert_eq 1 "$?" 'host key with an embedded newline refused'
+handoff "$tmp/good.json" "$host_pub" "$host_fp"
+vps "$tmp/good.json" --vps-ip 203.0.113.9 > "$tmp/good.log" 2>&1
+assert_eq 0 "$?" 'install with a pinned host key succeeds'
+record="$devroot/etc/wireguard/serverinator/devices/rn9p.json"
+assert_eq "$host_pub" "$(jq -r .ssh_host_pubkey "$record")" 'host key kept in the device record'
+
+script="$key_dir/client-setup-owner-rn9p.sh"
+assert_contains "$(cat "$script")" "SI_PHONE_HOSTKEY='$host_pub'" 'client script pins the phone host key'
+mkdir -p "$tmp/client"
+HOME="$tmp/client" bash "$script" > "$tmp/client.log" 2>&1
+assert_eq 0 "$?" 'client script runs'
+kh="$(cat "$tmp/client/.ssh/known_hosts")"
+assert_contains "$kh" "serverinated $host_pub" 'phone key pinned under the alias'
+assert_contains "$kh" "203.0.113.9 $(cut -d' ' -f1,2 "$tmp/vps_host.pub")" 'VPS key pinned for the jump'
+HOME="$tmp/client" bash "$script" > /dev/null 2>&1
+assert_eq 2 "$(wc -l < "$tmp/client/.ssh/known_hosts")" 'running it again adds no duplicates'
+assert_contains "$(cat "$tmp/client/.ssh/config")" 'HostKeyAlias serverinated' 'alias block has HostKeyAlias'
+
+opts="$(SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$devroot" bash -c 'source "$1"; opts=(); phone_hostkey_opts rn9p "$2"; echo "${opts[*]}"; cat "$(phone_known_hosts_file rn9p)"' _ "$VPS_SCRIPT" "$host_pub" 2>/dev/null)"
+assert_contains "$opts" 'StrictHostKeyChecking=yes' 'VPS checks the phone strictly'
+assert_contains "$opts" "serverinator-rn9p $host_pub" 'per-phone known_hosts holds the pinned key'
+opts="$(SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$devroot" bash -c 'source "$1"; opts=(); phone_hostkey_opts old ""; echo "${opts[*]}"' _ "$VPS_SCRIPT" 2>/dev/null)"
+assert_contains "$opts" 'StrictHostKeyChecking=accept-new' 'phone without a pinned key: trust on first use'
+assert_contains "$opts" 'known_hosts_old' 'in its own file'
+
+if command -v sshd >/dev/null && [[ -d /run/sshd ]]; then
+    port=$((20000 + RANDOM % 20000))
+    cat > "$tmp/sshd_config" <<EOF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $tmp/phone_host
+PidFile $tmp/sshd.pid
+PasswordAuthentication no
+EOF
+    chmod 600 "$tmp/phone_host"
+    "$(command -v sshd)" -f "$tmp/sshd_config" -E "$tmp/sshd.log"
+    sleep 0.5
+    real_ssh() { # PUBKEY
+        SERVERINATOR_DEV=1 SERVERINATOR_DEV_ROOT="$devroot" bash -c 'source "$1"; opts=()
+            phone_hostkey_opts rn9p "$2"
+            ssh -o BatchMode=yes -o ConnectTimeout=5 "${opts[@]}" -i /dev/null -p "$3" nobody@127.0.0.1 true' \
+            _ "$VPS_SCRIPT" "$1" "$port" 2>&1
+    }
+    out="$(real_ssh "$host_pub")"
+    assert_contains "$out" 'Permission denied' 'real sshd: pinned key accepted (stops at user auth)'
+    out="$(real_ssh "$(cut -d' ' -f1,2 "$tmp/other_host.pub")")"
+    assert_contains "$out" 'Host key verification failed' 'real sshd: a different host key is refused'
+    kill "$(cat "$tmp/sshd.pid")" 2>/dev/null
+else
+    echo "  SKIP: sshd unavailable; real host-key check not run"
+fi
+
+echo "Test: remote_cmd keeps every word as it was"
+got="$(bash -c 'source "$1"; line="$(remote_cmd printf "<%s>" "a b" "it'"'"'s" "\$(id)" "x;y" "")"; bash -c "$line"' _ "$REPO_ROOT/core/lib.sh")"
+assert_eq "<a b><it's><\$(id)><x;y><>" "$got" 'spaces, quotes, $() and ; arrive as plain words'
+assert_eq "si add-client bob" "$(bash -c 'source "$1"; remote_cmd si add-client bob' _ "$REPO_ROOT/core/lib.sh")" 'plain words stay readable'
+
+echo "Test: core-vps.sh is run on the VPS with quoted arguments"
+got="$(bash -c 'source "$1"; _vps_cmd() { printf "%s" "$*"; }; VPS_NEEDS_SUDO=1; SI_COLOR_ON=0; VPS_TMP_DIR="/tmp/serverinator.a b"
+    run_core_vps /tmp/h.json --vps-ip 203.0.113.9' _ "$REPO_ROOT/serverinator.sh")"
+assert_eq 'sudo env SERVERINATOR_COLOR=never bash /tmp/serverinator.a\ b/core-vps.sh /tmp/h.json --vps-ip 203.0.113.9' "$got" 'sudo, env and every argument quoted'
+
 exit "$TESTS_FAILED"

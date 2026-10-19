@@ -1,0 +1,12 @@
+Stand-ins for programs the install would otherwise run for real. tests/lib.sh
+puts this folder first on PATH, so DEV runs use them instead of the network,
+the kernel or a real Debian bootstrap. Anything they don't recognise goes to
+the real program.
+
+  wg           fixed keys for genkey/pubkey
+  debootstrap  a minimal rootfs (the four files rootfs_looks_complete checks)
+  curl         wstunnel and Ubuntu base downloads become small marker files;
+               any other URL goes to the real curl
+  sha256sum    a marker file hashes to its file's pinned checksum (lib.sh),
+               so verify_download accepts it; real files are hashed for real
+  tar          a marker archive "extracts" a fake wstunnel or a minimal rootfs

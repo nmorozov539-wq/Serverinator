@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stand-in for wg: fixed keys, nothing touches the kernel.
+case "${1:-}" in
+    genkey) echo 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ=' ;;
+    pubkey) cat > /dev/null; echo 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQ=' ;;
+    *) echo "wg (test fake): $*" >&2; exit 1 ;;
+esac

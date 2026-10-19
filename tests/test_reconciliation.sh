@@ -50,4 +50,13 @@ sed -i 's/MTU = 1280/MTU = 999/' "$WG_CONF"
 setup_wireguard > "$tmp/out" 2>&1
 assert_contains "$(cat "$WG_CONF")" 'MTU = 1280' 'existing config drift repaired without changing desired MTU'
 assert_file_exists "$WG_CONF.bak" 'WG backup exists'
+
+# A temp file left in service.d would run at boot.
+echo "Test: reconcile_file stages next to its backups, not in service.d"
+mkdir -p "$tmp/sd" "$tmp/bk"
+bash -c 'source "$1"; mktemp() { echo "$*" >> "'"$tmp"'/mk"; command mktemp "$@"; }; echo x | reconcile_file "$2/s.sh" 700 "$3"' \
+    _ "$REPO_ROOT/core/lib.sh" "$tmp/sd" "$tmp/bk" > /dev/null
+assert_contains "$(cat "$tmp/mk")" "$tmp/bk/" 'temp file in the backup folder'
+assert_eq 's.sh' "$(ls -A "$tmp/sd")" 'nothing else left in service.d'
+
 exit "$TESTS_FAILED"

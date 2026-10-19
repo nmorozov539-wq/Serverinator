@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install what the tests need
+        run: sudo apt-get update && sudo apt-get install -y jq openssh-client openssh-server util-linux curl shellcheck
+
+      - name: Tests (no phone, VPS or network)
+        run: bash tests/run_tests.sh
+
+      # As root with sshd, the guest and sshd tests also run end to end with
+      # real users, bind mounts and sshd instances.
+      - name: Tests as root, with the real sshd chains
+        run: sudo env SERVERINATOR_TEST_REAL_GUESTS=1 bash tests/run_tests.sh
+
+      - name: Shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x -S warning serverinator.sh core/*.sh core/si core/phone/*.sh core/vps/*.sh tools/*.sh
+          shellcheck -s sh -S warning core/templates/magisk-*.sh
+          shellcheck -S warning core/templates/client-setup.sh
